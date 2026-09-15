@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import { createFetchPin, isGatewayChat, provisionProfile, statusFileFor, withDefaults } from './index.js'
+import { createFetchPin, installPromptDisplay, isGatewayChat, provisionProfile, statusFileFor, withDefaults } from './index.js'
 
 // The hook publishes a status file by default; keep every run's out of the
 // user's real DSH_HOME (and let the default resolution be what is exercised).
@@ -35,6 +35,26 @@ function recorder() {
   }
   const record = (level) => (template, ...args) => lines[level].push(format(template, args))
   return { lines, info: record('info'), warn: record('warn'), error: record('error') }
+}
+
+/**
+ * A host plugin-context double.
+ *
+ * `apply` also registers a prompt-assembly listener on the Cordis event bus, so
+ * the double records the event names it was asked to listen for — that is how a
+ * thrown-away ctx would otherwise hide a registration.
+ */
+function ctxFor(logger, settings, effect = () => {}) {
+  const listeners = new Map()
+  return {
+    logger,
+    settings,
+    effect,
+    listeners,
+    on(event, listener, options) {
+      listeners.set(event, { listener, options })
+    },
+  }
 }
 
 const GATEWAY = 'https://api.cline.bot'
@@ -574,18 +594,21 @@ console.log('\n── 10. apply() ───────────────�
   const settings = makeSettings({ providers: {} })
   const logger = recorder()
   let disposer
-  await apply({ logger, settings, effect: (register) => { disposer = register() } }, {})
+  const boot = ctxFor(logger, settings, (register) => { disposer = register() })
+  await apply(boot, {})
   check('apply hooks the global fetch', globalThis.fetch !== realFetch)
   check('apply opens no listener at all', tcpServers() === baseline, `tcp servers ${baseline} -> ${tcpServers()}`)
   check('the profile is created against the gateway', settings.writes[0]?.ops[0]?.value?.baseURL === 'https://api.cline.bot/api/v1', JSON.stringify(settings.writes[0]?.ops[0]?.value?.baseURL))
   check('a stored "max" effort is left alone', settings.writes.length === 1 && !settings.writes.some((write) => write.ns === 'agent-default-model'), JSON.stringify(settings.writes.map((write) => write.ns)))
   check('apply reports the in-process hook', logger.lines.info.some((line) => line.includes('pin injected in-process, no listener')))
+  check('apply registers the prompt-display listener', boot.listeners.has('system-prompt/assemble'))
+  check('…and says which model id the prompt will show', logger.lines.info.some((line) => line.includes('prompt shows deepseek-v4.1-flash')), JSON.stringify(logger.lines.info))
   disposer()
   check('unloading restores the global fetch', globalThis.fetch === realFetch)
 
   const oddEffort = makeSettings({ providers: {} }, 'turbo')
   let oddDisposer
-  await apply({ logger: recorder(), settings: oddEffort, effect: (register) => { oddDisposer = register() } }, {})
+  await apply(ctxFor(recorder(), oddEffort, (register) => { oddDisposer = register() }), {})
   check('an unsupported stored effort is realigned to high', oddEffort.writes[1]?.ops[0]?.value === 'high', JSON.stringify(oddEffort.writes[1]?.ops[0]))
   oddDisposer()
   check('that hook is disposed again', globalThis.fetch === realFetch)
@@ -594,7 +617,7 @@ console.log('\n── 10. apply() ───────────────�
   const legacySettings = makeSettings({ providers: {} })
   const legacyBoot = recorder()
   let legacyDisposer
-  await apply({ logger: legacyBoot, settings: legacySettings, effect: (register) => { legacyDisposer = register() } }, { transport: 'proxy', listen: '127.0.0.1:0' })
+  await apply(ctxFor(legacyBoot, legacySettings, (register) => { legacyDisposer = register() }), { transport: 'proxy', listen: '127.0.0.1:0' })
   check('a legacy transport: proxy config opens no listener', tcpServers() === baseline, `tcp servers ${baseline} -> ${tcpServers()}`)
   check('…and is reported, then served in-process', legacyBoot.lines.warn.some((line) => line.includes('"transport"')) && globalThis.fetch !== realFetch, JSON.stringify(legacyBoot.lines.warn))
   check('…and its card still points at the gateway', legacySettings.writes[0].ops[0].value.baseURL === 'https://api.cline.bot/api/v1', legacySettings.writes[0].ops[0].value.baseURL)
@@ -605,30 +628,37 @@ console.log('\n── 10. apply() ───────────────�
   const badUrlSettings = makeSettings({ providers: {} })
   globalThis.fetch = realFetch
   let badUrlEffects = 0
-  await apply({ logger: badUrl, settings: badUrlSettings, effect: () => { badUrlEffects += 1 } }, { upstream: 'api.cline.bot' })
+  const badUrlCtx = ctxFor(badUrl, badUrlSettings, () => { badUrlEffects += 1 })
+  await apply(badUrlCtx, { upstream: 'api.cline.bot' })
   check('an upstream that is not a URL is reported at boot', badUrl.lines.error.some((line) => line.includes('is not a URL')), JSON.stringify(badUrl.lines.error))
   // …and nothing happens: no hook to dispose, no card written from a typo.
   check('…nothing is hooked', globalThis.fetch === realFetch && badUrlEffects === 0, `effects=${badUrlEffects}`)
   check('…and no card is written from it', badUrlSettings.writes.length === 0, JSON.stringify(badUrlSettings.writes))
+  check('…and not even the prompt listener is registered', badUrlCtx.listeners.size === 0, JSON.stringify([...badUrlCtx.listeners.keys()]))
 
   const noFetch = recorder()
   const savedFetch = globalThis.fetch
   globalThis.fetch = undefined
-  await apply({ logger: noFetch, settings: makeSettings({ providers: {} }), effect: () => {} }, {})
+  await apply(ctxFor(noFetch, makeSettings({ providers: {} })), {})
   globalThis.fetch = savedFetch
   check('a hook that could not be installed says so', noFetch.lines.error.some((line) => line.includes('could not hook the global fetch')))
   check('…and is not also announced as injected', !noFetch.lines.info.some((line) => line.includes('pin injected in-process')), JSON.stringify(noFetch.lines.info))
 
   const shadowed = recorder()
-  await apply(
-    { logger: shadowed, settings: makeSettings({ providers: {} }), effect: () => {} },
-    { pins: { 'cline-pass/deepseek-v4.1-flash': [] } },
-  )
+  await apply(ctxFor(shadowed, makeSettings({ providers: {} })), { pins: { 'cline-pass/deepseek-v4.1-flash': [] } })
   check(
     'an empty per-model pin that shadows a real one is reported',
     shadowed.lines.warn.some((line) => line.includes('pins["cline-pass/deepseek-v4.1-flash"] is empty')),
     JSON.stringify(shadowed.lines.warn),
   )
+
+  const displayOff = recorder()
+  let displayOffDisposer
+  const displayOffCtx = ctxFor(displayOff, makeSettings({ providers: {} }), (register) => { displayOffDisposer = register() })
+  await apply(displayOffCtx, { plainModelId: false })
+  check('plainModelId: false registers no prompt listener', !displayOffCtx.listeners.has('system-prompt/assemble'), JSON.stringify([...displayOffCtx.listeners.keys()]))
+  check('…and the boot line says the configured id is what shows', displayOff.lines.info.some((line) => line.includes('prompt shows the configured model id')), JSON.stringify(displayOff.lines.info))
+  displayOffDisposer()
 
   globalThis.fetch = realFetch
   await new Promise((resolve) => control.close(resolve))
@@ -674,6 +704,68 @@ console.log('\n── 11. integration through the real fetch ──────�
 
   await new Promise((resolve) => gateway.close(resolve))
   await new Promise((resolve) => elsewhere.close(resolve))
+}
+
+// ── 12. the prompt display ──────────────────────────────────────────────────
+console.log('\n── 12. the prompt display ────────────────────────────────')
+{
+  const cfg = withDefaults({})
+  const ctx = ctxFor(recorder(), undefined)
+  installPromptDisplay(ctx, cfg)
+  const registered = ctx.listeners.get('system-prompt/assemble')
+  check('the assembly listener is registered on the event bus', registered !== undefined)
+  // The whole reason the rewrite works: `installModelSelection` applies the
+  // session's live selection *after* every inner listener returns, and only a
+  // listener outside it ever sees the model the next request will use.
+  check('…prepended, so it sits outside the model-selection listener', registered?.options?.prepend === true, JSON.stringify(registered?.options))
+
+  /** An assembly as the loop leaves it, with the live selection already applied. */
+  const assembly = (variables = {}) => ({
+    sections: [
+      { name: 'harness:identity', text: 'You are an AI agent powered by DeepSeek Harness.' },
+      { name: 'deployment:persona-prefix', text: 'You are a coding agent powered by the {{model}} model.' },
+      { name: 'deployment:persona-suffix', text: 'Your working directory is {{cwd}}.' },
+      { name: 'tool:bash', text: 'Model {{model}}, literally.', interpolate: false },
+    ],
+    contexts: [],
+    tools: [],
+    variables: { provider: 'cline-pass', model: 'cline-pass/deepseek-v4.1-flash', cwd: '/tmp', ...variables },
+  })
+  const through = (input) => registered.listener(input, {}, () => Promise.resolve(input))
+  const textOf = (result, name) => result.sections.find((section) => section.name === name).text
+
+  const live = await through(assembly())
+  check(
+    'the persona shows the bare DeepSeek id',
+    textOf(live, 'deployment:persona-prefix') === 'You are a coding agent powered by the deepseek-v4.1-flash model.',
+    textOf(live, 'deployment:persona-prefix'),
+  )
+  check('…while the variables keep the wire id', live.variables.model === 'cline-pass/deepseek-v4.1-flash', live.variables.model)
+  check('a sibling variable in the same section still resolves later', textOf(live, 'deployment:persona-suffix') === 'Your working directory is {{cwd}}.')
+  check('a literal (interpolate: false) section is untouched', textOf(live, 'tool:bash') === 'Model {{model}}, literally.')
+  check('the harness identity is untouched', textOf(live, 'harness:identity') === 'You are an AI agent powered by DeepSeek Harness.')
+  check('the input assembly is not mutated', assembly().sections[1].text === 'You are a coding agent powered by the {{model}} model.')
+
+  const official = assembly({ provider: 'deepseek', model: 'deepseek-v4-flash' })
+  check('an official bare id is a no-op (same assembly)', (await through(official)) === official)
+  const otherRoute = assembly({ provider: 'other', model: 'other/glm-5.3-flash' })
+  check('another route’s prefixed id is not ours to rename', (await through(otherRoute)) === otherRoute)
+  const bareOnThisRoute = assembly({ model: 'glm-5.3-flash' })
+  check('a bare id on this route is a no-op', (await through(bareOnThisRoute)) === bareOnThisRoute)
+  const prefixOnly = assembly({ model: 'cline-pass/' })
+  check('a prefix with no model behind it is a no-op', (await through(prefixOnly)) === prefixOnly)
+  const noReference = { ...assembly(), sections: [{ name: 'deployment:persona-prefix', text: 'Be brief.' }] }
+  check('a persona without the reference is a no-op', (await through(noReference)) === noReference)
+  check('an assembly with no section list is passed straight through', (await through(undefined)) === undefined)
+
+  const renamed = ctxFor(recorder(), undefined)
+  installPromptDisplay(renamed, withDefaults({ provider: 'tunnel', model: 'tunnel/deepseek-v4.1-flash' }))
+  const renamedLive = await renamed.listeners.get('system-prompt/assemble').listener(assembly({ provider: 'tunnel', model: 'tunnel/deepseek-v4.1-flash' }), {}, () => Promise.resolve(assembly({ provider: 'tunnel', model: 'tunnel/deepseek-v4.1-flash' })))
+  check(
+    'a renamed route strips its own prefix, not a hardcoded one',
+    textOf(renamedLive, 'deployment:persona-prefix') === 'You are a coding agent powered by the deepseek-v4.1-flash model.',
+    textOf(renamedLive, 'deployment:persona-prefix'),
+  )
 }
 
 console.log(`\nRESULT: ${failures.length === 0 ? 'FETCH OK' : `FAILED (${failures.join(' | ')})`}`)

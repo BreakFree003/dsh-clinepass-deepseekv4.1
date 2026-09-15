@@ -16,13 +16,20 @@ API key 在 **设置 → 模型** 里直接填。**默认不开任何本地端�
 
 ## 它做了什么（架构）
 
-两件事各由最合适的部分负责：
+三件事各由最合适的部分负责：
 
 1. **路由本身**是一个普通的 **pi-ai provider profile**（`llm-pi-ai.providers.cline-pass`）：OpenAI 兼容协议 + 一个存在凭据库里的 key。
    正因为如此，它才会**原生出现在「设置 → 模型」**里 —— key 输入框、模型目录、地址都是 dsh 自带的界面，不需要自写 UI，也不需要一个可能随 dsh 升级而漂移的手写流式 adapter。
 
 2. **本插件**只做一件事：给请求体加上**渠道钉选字段**。
    Cline Pass 的钉选是请求体里的 `providerOptions.gateway.only`，而 dsh 刻意屏蔽了 pi-ai 的 `openRouterRouting` / `vercelGatewayRouting` 兼容开关 —— settings 里写不了。插件把这个字段加在**出去的请求**上，字节层面其它什么都不動，SSE / 工具调用 / 推理 / 用量 / 图片全部走 pi-ai 已验证的通路。
+
+3. **提示词里的模型名去前缀**（0.6.2 起）。网关要求请求体的 `model` 是 `type/model` 形状（裸 id 会被拒：
+   `invalid model format. Expected format: modelType/model`），而 dsh 把 catalog 的 `models[].id` 原样发给线上 ——
+   所以这条路由的 id 必须写成 `cline-pass/deepseek-v4.1-flash`。前缀是**传输层**的要求，但 `{{model}}`
+   会把它当模型名渲染进 persona，而官方部署的提示词里是没有前缀的（官方 `deepseek` 路由的 id 本身就是裸 id）。
+   插件因此在提示词**装配**时把 persona 两段模板里的 `{{model}}` 换成 `deepseek-v4.1-flash`：线上 id、
+   会话记录、选择器都不动，只改提示词显示。详见下面的 `plainModelId` 选项。
 
 ```
 dsh ──pi-ai──> https://api.cline.bot/api/v1   （进程内改写请求体，无监听、无端口）
@@ -69,7 +76,7 @@ dsh plugin --profile web remove dsh-clinepass
 要锁版本就带上 tag（不带则取默认分支的最新提交）：
 
 ```sh
-dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1#v0.6.1
+dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1#v0.6.2
 ```
 
 > 这条路径要求 PATH 上有 `pnpm` —— `dsh plugin` 本身就是 pnpm 转发器。
@@ -163,9 +170,18 @@ key 也可以在启动环境里给（凭据库优先）：`CLINE_PASS_API_KEY=sk
 | `apiKeyEnv` | `CLINE_PASS_API_KEY` | profile 里记录的凭据引用 |
 | `provision` | `true` | 启动时自动登记 provider profile（缺失则创建；自家卡片地址过期则只修地址） |
 | `alignReasoningEffort` | `true` | 若 `agent-default-model.reasoningEffort` 不是本模型声明的档位（只剩 `high` / `max` 两个），启动时对齐：废弃的 `xhigh` → `max`，其它不认识的值 → `high` |
+| `plainModelId` | `true` | 提示词（persona 两段）里显示**去掉本路由前缀**的 id：`cline-pass/deepseek-v4.1-flash` → `deepseek-v4.1-flash`。线上 id、会话记录、选择器都不受影响；`false` 则原样显示完整 id |
 | `statusFile` | `true` | 把钉选状态写到 `<DSH_HOME>/dsh-clinepass-status.json`（见下）；也可给自定义路径，或 `false` 关掉 |
 
 > `pin: []` = 不注入任何字段（纯透传）。`pins` 优先于 `pin`；把某个模型配成 `pins: { '<model>': [] }` 等于**单独关掉**那条路由的钉选，启动时会警告。
+>
+> `plainModelId` 只改**提示词模板**（`deployment:persona-prefix` / `-suffix` 两段里的 `{{model}}`），
+> 且仅当会话确实跑在本路由、且 id 以本路由自己的 `<provider>/` 开头时才改；官方路由的裸 id、
+> 别的 provider、本路由上的裸 id、以及 `interpolate: false` 的字面量段落一律不动。
+> 刻意不去改 catalog id（已存会话的 `model/selection` / `request/header` 里记的还是带前缀的 id，
+> 改名会让它们一直报 `UNKNOWN_MODEL`），也不去改 prompt variable（会话层的
+> `installModelSelection` 会在内层 listener 返回后覆盖 `variables.model`，而且
+> `session-reference` 会快照那些变量算引用预算）。
 >
 > 已删除（0.5.0）：`transport`、`listen`、`captureDir`，以及旧版的 `address` / `baseURL`。旧配置里留着不会报错，启动日志会各指出一次。
 
@@ -265,9 +281,9 @@ node uninstall.mjs --keep-provider  # 保留设置页那张卡片
 
 **dsh-clinepass** connects Cline Pass to DeepSeek Harness with every request **pinned to the DeepSeek upstream channel** (strict, no fallback), and its API key entered on **Settings → Models**.
 
-**Architecture.** The route is an ordinary **pi-ai provider profile** (`llm-pi-ai.providers.cline-pass`, OpenAI-compatible, key from the credential store) — which is exactly why dsh renders a native provider card with a key field for it. The plugin only adds `providerOptions.gateway.only` to outgoing requests, leaving streaming, tool calls, reasoning, usage and images on pi-ai's proven path. The pin is injected **in-process**: the plugin wraps `globalThis.fetch` for the life of the process and rewrites **only** this gateway's chat-completions bodies — **no listener, no port, nothing to configure for transport**. (0.5.0 removed the optional loopback reverse proxy; a config still naming `transport` / `listen` / `captureDir` is reported once and ignored.) Only requests to the configured `upstream` origin are ever touched, and unrelated calls are passed through as the exact same arguments. On start the plugin also **provisions** the profile (repairing only a recognisably-own stale address, never overwriting a foreign one) and aligns an unsupported stored reasoning level.
+**Architecture.** The route is an ordinary **pi-ai provider profile** (`llm-pi-ai.providers.cline-pass`, OpenAI-compatible, key from the credential store) — which is exactly why dsh renders a native provider card with a key field for it. The plugin only adds `providerOptions.gateway.only` to outgoing requests, leaving streaming, tool calls, reasoning, usage and images on pi-ai's proven path. The pin is injected **in-process**: the plugin wraps `globalThis.fetch` for the life of the process and rewrites **only** this gateway's chat-completions bodies — **no listener, no port, nothing to configure for transport**. (0.5.0 removed the optional loopback reverse proxy; a config still naming `transport` / `listen` / `captureDir` is reported once and ignored.) Only requests to the configured `upstream` origin are ever touched, and unrelated calls are passed through as the exact same arguments. On start the plugin also **provisions** the profile (repairing only a recognisably-own stale address, never overwriting a foreign one) and aligns an unsupported stored reasoning level. Since 0.6.2 it also keeps the gateway's `type/` prefix out of the **prompt**: a prepended `system-prompt/assemble` listener rewrites the `{{model}}` reference in the two persona sections, so the persona reads `deepseek-v4.1-flash` while the wire, the session records and the model picker keep `cline-pass/deepseek-v4.1-flash` (`plainModelId: false` turns this off).
 
-**Install.** `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1` — the package declares `dsh.bundle.patch`, so `dsh plugin` (a pnpm forwarder) installs it and appends it to `dsh.profile.bundles` on its own: no clone, no hand-edited patch. Append `#v0.6.1` to pin a tag. Without pnpm, `node install.mjs` copies the plugin into the profile and appends the loader row instead (idempotent + backed up) — use one route or the other, never both. Restart dsh either way, then set the key on Settings → Models. Configuration defaults are complete — `upstream`, `pin`, `pins`, `provider`, `model`, `apiKeyEnv`, `provision`, `alignReasoningEffort`, `statusFile`. **No third-party dependencies**: the plugin imports only Node built-ins, so the whole thing is one auditable file.
+**Install.** `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1` — the package declares `dsh.bundle.patch`, so `dsh plugin` (a pnpm forwarder) installs it and appends it to `dsh.profile.bundles` on its own: no clone, no hand-edited patch. Append `#v0.6.2` to pin a tag. Without pnpm, `node install.mjs` copies the plugin into the profile and appends the loader row instead (idempotent + backed up) — use one route or the other, never both. Restart dsh either way, then set the key on Settings → Models. Configuration defaults are complete — `upstream`, `pin`, `pins`, `provider`, `model`, `apiKeyEnv`, `provision`, `alignReasoningEffort`, `plainModelId`, `statusFile`. **No third-party dependencies**: the plugin imports only Node built-ins, so the whole thing is one auditable file.
 
 **Verify.** `cat ~/.dsh/dsh-clinepass-status.json` — the running dsh writes its hook state and counters there (`hook: installed`, `seen`/`pinned`/`skipped`, last pin), which is how a silently bypassed hook becomes visible; `node test-package.mjs` (packaging invariants: the bundle declaration is installable, no lifecycle scripts, and the bundle and installer rows cannot drift), `node test-fetch.mjs` (URL scoping, pass-through fidelity, install/uninstall and reload semantics, body shapes, robustness, status file, integration through the real fetch), `node test-settings.mjs` (the option surface, provisioning and the effort migration), `node test-install.mjs` (install/uninstall round trips), `node smoke-test.mjs [--negative]` (checks the live process's status file, then runs a real gateway round trip asserting `finalProvider: "deepseek"` and no fallbacks). 
 

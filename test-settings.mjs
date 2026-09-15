@@ -68,6 +68,8 @@ console.log('\n── 1. option surface ─────────────�
   check('a numeric string is accepted as a size', withDefaults({ maxTokens: '4096' }).maxTokens === 4096, String(withDefaults({ maxTokens: '4096' }).maxTokens))
   check('provision: false is respected', withDefaults({ provision: false }).provision === false)
   check('alignment can be disabled', withDefaults({ alignReasoningEffort: false }).alignReasoningEffort === false)
+  check('the route-relative prompt id is on by default', withDefaults({}).plainModelId === true)
+  check('…and can be turned off', withDefaults({ plainModelId: false }).plainModelId === false)
 
   // An install written for the removed loopback transport must still boot: the
   // option is reported once and ignored, never fatal.

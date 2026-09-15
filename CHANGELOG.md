@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.6.2
+
+**One new behavior, one new option — the pin hook, the profile provisioning and
+the wire body are untouched.**
+
+Added:
+
+- **The prompt shows the route-relative model id.** The `type/` prefix is a
+  gateway requirement on the *wire* (`type/model`, a bare id is rejected), and
+  dsh sends a catalog id to the wire verbatim — so the persona used to read
+  "powered by the cline-pass/deepseek-v4.1-flash model", where every first-party
+  route shows a bare id. `index.js` now prepends a `system-prompt/assemble`
+  listener that rewrites the `{{model}}` reference inside the two persona
+  sections (`deployment:persona-prefix` / `-suffix`, the
+  `PERSONA_*_SECTION` ids of `@deepseek-ai/dsh-system-prompt`) to
+  `deepseek-v4.1-flash`.
+  - It only touches this route's own ids while the session is actually on this
+    route; a bare `deepseek-v4-flash`, another provider, a bare id on this route
+    and an `interpolate: false` section are all left alone.
+  - It rewrites the *template*, not `assembly.variables`: the session layer
+    (`installModelSelection` in `@deepseek-ai/dsh-agent`) applies the live
+    selection to those variables after every inner listener, and
+    `@deepseek-ai/dsh-session-reference` snapshots them to size its reference
+    budget.
+  - The listener is prepended, which is what puts it *outside* that selection
+    listener and makes it see the model the next request will use — including
+    for agents that already existed when the plugin mounted.
+  - Not done by renaming the catalog id: every stored session's
+    `model/selection` / `request/header` carries the prefixed id, so a rename
+    would fail as `UNKNOWN_MODEL` until each session re-picks its model.
+- **`plainModelId`** (default `true`) turns the rewrite off; the boot line then
+  says `prompt shows the configured model id`.
+
+The boot line now ends with what the prompt will show, e.g.
+`… ; prompt shows deepseek-v4.1-flash (no route prefix)`.
+
+Verified live, not only in the suite: a subagent spawned in the running web host
+rendered `You are a coding agent powered by the deepseek-v4.1-flash model.`, and
+its committed `system/message` contained no `cline-pass/` at all — while
+`request/header` and `request/context` kept the wire id, as they must.
+
 ## 0.6.1
 
 **Documentation only — `index.js` is byte-identical to 0.6.0.** Corrects claims
