@@ -1,0 +1,28 @@
+# The one entry dsh-clinepass needs in a profile's cordis.patch.yml.
+#
+# `upstream` and `pin` have working defaults (https://api.cline.bot,
+# ["deepseek"]), so mounting the row is enough. install.mjs appends this block
+# for you.
+- insert:
+    - id: clinepass
+      name: './plugins/dsh-clinepass/index.js'
+      config:
+        # Real gateway origin. The profile is pointed straight at it: the pin is
+        # injected in-process by wrapping `globalThis.fetch`, so this plugin
+        # opens no listener and no port.
+        upstream: https://api.cline.bot
+        # Upstream channels every pinned request is restricted to.
+        pin:
+          - deepseek
+        # Optional: per-model pins, e.g.
+        # pins:
+        #   cline-pass/deepseek-v4.1-flash:
+        #     - deepseek
+        # Optional: where the running plugin reports its state
+        # (`hook`/`seen`/`pinned`/`lastPin`). Defaults to
+        # <DSH_HOME>/dsh-clinepass-status.json; `false` turns it off.
+        # statusFile: /tmp/dsh-clinepass-status.json
+        # Optional: `false` to skip provisioning the provider card, and
+        # `false` to skip migrating a stored reasoning effort.
+        # provision: true
+        # alignReasoningEffort: true

@@ -1,0 +1,18 @@
+# Dependencies (this package has none of its own — it imports only Node built-ins)
+node_modules/
+pnpm-lock.yaml
+package-lock.json
+
+# Packed tarballs: releases attach these as assets, they are not committed
+*.tgz
+*.tar.gz
+
+# Installer / uninstaller backups (*.bak-<timestamp>)
+*.bak
+*.bak-*
+
+# Runtime state written by a running dsh that has the plugin mounted
+dsh-clinepass-status.json
+
+# macOS
+.DS_Store
