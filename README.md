@@ -41,11 +41,13 @@ dsh ──pi-ai──> https://api.cline.bot/api/v1   （进程内改写请求�
 
 ## 环境要求
 
-- dsh `0.1.5` 及以上（开发者预览版系列）
+- dsh `0.1.6-alpha.1`（**唯一实测过的版本**）。注意 npm 上**没有** `0.1.5` 这个版本，只有
+  `0.1.5-alpha.*` / `0.1.5-rc.*`；`dsh plugin` 与 `dsh.bundle` 相关的模块从 `0.1.2-alpha.3`
+  的包里就已存在，但更早的版本没有实测过，不保证。
 - Node.js ≥ 20
 - 一个 Cline Pass API key（`sk_...`）
 
-**没有任何第三方依赖**：插件只用 Node 内置模块，`index.js` 一个文件就能读完、审完。`test-fetch.mjs` / `test-settings.mjs` / `test-install.mjs` 在任何目录都能跑（不需要 dsh 的 `node_modules`）；`smoke-test.mjs` 要读 `settings.yaml`，所以需要 dsh 自带的 `js-yaml`。
+**没有任何第三方依赖**：插件只用 Node 内置模块，`index.js` 一个文件就能读完、审完。`test-package.mjs` / `test-fetch.mjs` / `test-settings.mjs` / `test-install.mjs` 在任何目录都能跑（不需要 dsh 的 `node_modules`）；`smoke-test.mjs` 要读 `settings.yaml`，所以需要 dsh 自带的 `js-yaml`。
 
 ## 安装
 
@@ -89,6 +91,8 @@ node install.mjs --dry-run                     # 只看会改什么
 ```
 
 > `--transport` / `--port` 在 0.5.0 已移除。安装器会明确拒绝它们，而不是默默忽略 —— 一个被忽略的 `--port` 看起来会像"生效了"。
+>
+> `--dry-run` 只是不写文件，**仍然要求那个 profile 已经存在**：没有的话它会报 `no profile at …` 并以 1 退出（信息里告诉你了先启动一次 dsh）。这不是 bug，是不想对着一个你还没创建的目标做"预览"。
 
 安装器会：把插件复制到 `<DSH_HOME>/profiles/<profile>/plugins/dsh-clinepass/`，并把一条 loader 行追加到该 profile 的 `cordis.patch.yml`（**幂等**，改动前自动备份；重跑会把旧行升级成当前规范形态）。
 
@@ -98,7 +102,7 @@ node install.mjs --dry-run                     # 只看会改什么
 
 ### 方式 C：手动
 
-1. 复制 `index.js`、`package.json`、`test-fetch.mjs`、`test-settings.mjs` 到 `<DSH_HOME>/profiles/<profile>/plugins/dsh-clinepass/`；
+1. 复制 `index.js`、`package.json`、`test-fetch.mjs`、`test-settings.mjs` 到 `<DSH_HOME>/profiles/<profile>/plugins/dsh-clinepass/`（这是**最小可运行集**；下面「验证」一节里的 `test-package.mjs` 与 `test-install.mjs` 检查的是仓库/安装器布局，这样装没有它们，也跑不了）；
 2. 在 `<DSH_HOME>/profiles/<profile>/cordis.patch.yml` 里加一段（见 `patch.example.yml`）：
 
 ```yaml
@@ -169,20 +173,27 @@ key 也可以在启动环境里给（凭据库优先）：`CLINE_PASS_API_KEY=sk
 
 ```sh
 cat ~/.dsh/dsh-clinepass-status.json     # 正在跑的 dsh 自己写的状态（见下）
-# {"service":"dsh-clinepass","transport":"fetch","hook":"installed","pin":["deepseek"],
-#  "counters":{"seen":4,"pinned":4,"skipped":0},"lastPin":{"model":"cline-pass/...","only":["deepseek"],...},
-#  "ignoredOptions":[],"pid":1234}
+# 实际是 2 空格缩进的 JSON，字段就是这些：
+# {
+#   "service": "dsh-clinepass", "transport": "fetch", "hook": "installed",
+#   "upstream": "https://api.cline.bot", "pin": ["deepseek"],
+#   "profileBaseURL": "https://api.cline.bot/api/v1",
+#   "counters": { "seen": 4, "pinned": 4, "skipped": 0 },
+#   "lastPin": { "model": "cline-pass/deepseek-v4.1-flash", "only": ["deepseek"] },
+#   "ignoredOptions": [], "pid": 1234, "at": "2026-09-15T11:13:13.910Z"
+# }
 
 node test-package.mjs       # 打包不变量：bundle 声明可用、无生命周期脚本、bundle 行与安装器行不漂移
-node test-fetch.mjs         # 单元测试：URL 域限定/透传保真/安装卸载/请求体形态/robustness/状态文件/真 fetch 集成
+node test-fetch.mjs         # 单元测试：URL 域限定/透传保真/安装卸载/请求体形态/robustness/状态文件 + 经真 fetch(undici) 打本地 server 的集成
 node test-settings.mjs      # 配置面（含已删除选项）、profile 登记与修复、档位迁移
 node test-install.mjs       # 安装器/卸载器往返测试（幂等、注释不丢、逐字节还原）
 node smoke-test.mjs         # 冒烟：读状态文件确认活着的 dsh 挂着钩子 + 经真网关跑一轮，断言 finalProvider=deepseek
 node smoke-test.mjs --negative   # 追加反向对照：不可能渠道必须被拒绝
 ```
 
-没有测试框架，全是自带断言的 Node 脚本（零依赖）。`npm test` 跑前四个；其中
-`test-fetch.mjs` 末尾会真的往网关发一次请求，需要网络。`smoke-test.mjs` 另外还要求
+没有测试框架，全是自带断言的 Node 脚本（零依赖）。`npm test` 跑前四个，**四个都不需要网络**：
+`test-fetch.mjs` 用一个本地 HTTP server 冒充网关（它自己的文件头也是这么写的），走真
+undici、但只连 `127.0.0.1`。唯一会真的打网关的是 `smoke-test.mjs`，它另外还要求
 **正在运行**的 dsh。
 
 `hook` 字段就是「静默失效」的报警器：`installed` = 钩子在全局 fetch 上；`uninstalled` = 被卸载了；`unavailable` = 装不进去（有东西先替换了 fetch，日志里会报，这种情况现在没有备用 transport 可切，要先找出是哪个插件抢了全局 fetch）；`foreign` = 装好之后有别的代码把全局 fetch 换掉了（插件每 30 秒自查一次，所以最迟半分钟内可见；换掉之后请求就不再被钉）。`counters.seen` 是落到本网关的 chat 请求数，`pinned` 是真正注入了钉选的请求数 —— **`seen` 涨而 `pinned` 不涨**就说明有请求被跳过了（日志里有 `[clinepass] not pinning ...` 的原因）。状态文件里**不含任何凭据**，并且只有当前持有全局 fetch 的那个插件实例会写它。
@@ -211,8 +222,8 @@ node smoke-test.mjs --negative   # 追加反向对照：不可能渠道必须被
 ## 安全说明
 
 - **不监听任何端口**：插件只包一层 `globalThis.fetch`，且只改写发往 `upstream` 的 `chat/completions`。
-- 插件**不持有** API key —— key 由 dsh 从凭据库取出、写进请求头，插件只加一个路由字段。状态文件里只有计数、时间、模型名与钉选渠道，没有密钥。
-- 日志只打印请求方法/路径/模型/钉选渠道，`authorization` 会被脱敏成 `sk_ab…yz (len=NN)` 这种形状（形状示例，不是任何真实 key）。
+- 插件**不持有** API key —— key 由 dsh 从凭据库取出、写进请求头，插件只加一个路由字段。状态文件里只有服务与钩子状态、上游与 profile 地址、计数与时间、模型名、钉选渠道和 pid：**没有任何密钥**，`test-fetch.mjs` 里有一条断言专门守着这一点。
+- 日志只打印请求方法/URL/模型/钉选渠道（形如 `[clinepass] → #004 POST https://api.cline.bot/api/v1/chat/completions pinned to deepseek (model …, in-process)`），以及配置/登记结果与「没钉上的原因」。**请求头从不进日志** —— `authorization` 没有被打印的机会，也就不存在"脱敏"这一步。
 - 旧版的 `captureDir` 会把请求/响应原文（含对话内容）落盘，该功能已随反代一起删除。
 
 ## 与 npm 上 `dsh-cline-pass` 的区别
@@ -266,7 +277,7 @@ node uninstall.mjs --keep-provider  # 保留设置页那张卡片
 
 **See also.** A related package named `dsh-cline-pass` (npm, by yhshzh) solves overlapping problems with a self-contained provider adapter and account pool; this one (`dsh-clinepass`, no hyphen) deliberately reuses dsh's built-in pi-ai route and only injects the pin field. Both register provider routes — do not mount both.
 
-**Security.** The plugin opens no socket at all, and the hook only rewrites requests aimed at the configured gateway origin. It holds no credential of its own (the key travels in the request header dsh sets), its status file contains no secrets, and logs redact the auth header.
+**Security.** The plugin opens no socket at all, and the hook only rewrites requests aimed at the configured gateway origin. It holds no credential of its own (the key travels in the request header dsh sets), its status file contains no secrets (a test asserts this), and **no request header is ever logged** — the log carries only method, URL, model and pin channel, so there is nothing to redact.
 
 ## License
 
