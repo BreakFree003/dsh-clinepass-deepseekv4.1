@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.1
+
+**Documentation only — `index.js` is byte-identical to 0.6.0.** Corrects claims
+an independent review showed to be wrong, two of them introduced while preparing
+0.6.0.
+
+- **`test-fetch.mjs` needs no network.** The README said it "really hits the
+  gateway at the end, needs network". It does not: the suite stands local HTTP
+  servers in for the gateway and speaks real undici to `127.0.0.1` only — its own
+  file header says exactly that. The suite is hermetic, so it can be run offline
+  and in CI without egress.
+- **The plugin never logs request headers.** The README described `authorization`
+  being redacted to an example value; `index.js` logs the method, URL, model and
+  pin channel, plus the reason a request went out unpinned — and never a header.
+  The true statement is stronger: there is nothing to redact. The example is now
+  removed outright rather than reworded, because the old example value was not
+  synthetic.
+- **The status file** also carries `upstream`, `profileBaseURL`, `pid` and `at`
+  (and is 2-space pretty-printed); the README listed only counters/time/model/
+  channels, and its sample omitted those fields.
+- **Required dsh version.** There is no `0.1.5` on npm — only `0.1.5-alpha.*` /
+  `0.1.5-rc.*`. The README now names `0.1.6-alpha.1` as the tested version, and
+  notes that the `dsh plugin` / `dsh.bundle` modules exist back to
+  `0.1.2-alpha.3`, untested.
+- **Manual install (方式 C)** copies a minimal file set and now says so, because
+  the verification section advertises `test-package.mjs` / `test-install.mjs`,
+  which belong to the repo/installer layout and cannot run there.
+- **`install.mjs --dry-run`** still requires an existing profile: it exits 1 with
+  a pointer to start dsh once. The README presented it as a plain preview.
+
+Not changed: the pin hook, every option and default, the status-file format, the
+bundle declaration, and both install routes. `v0.6.0` is left in place and is
+still resolvable.
+
 ## 0.6.0
 
 **Distribution only — no runtime change.** The pin hook, its options and its
