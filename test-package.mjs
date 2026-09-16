@@ -84,5 +84,61 @@ if (block !== null) {
 }
 check('the row is an insert, not a disable/override', bundleLines[0] === '- insert:', bundleLines[0])
 
+// ── 5. the browser half is declared the way the client module system reads it ─
+console.log('\n── 5. client half declaration ────────────────────────────')
+// `dsh-client-modules` finds a plugin's client bundle by scanning the enabled
+// loader entries upward to the nearest package.json, then reading
+// `dsh.client.platform` and `exports["./client"]`. Both are silent when wrong:
+// the host half keeps working and the card simply never appears.
+const clientExport = manifest.exports?.['./client']
+check('the manifest exports a ./client bundle', typeof clientExport === 'string', JSON.stringify(manifest.exports ?? {}))
+check('…that exists', typeof clientExport === 'string' && fs.existsSync(path.join(HERE, clientExport)), String(clientExport))
+check('…and is shipped', (manifest.files ?? []).includes('client.js'), JSON.stringify(manifest.files ?? []))
+check('the manifest declares it as a web client half', manifest.dsh?.client?.platform === 'web', JSON.stringify(manifest.dsh?.client))
+check('the installer copies it too', /const files = \[[^\]]*'client\.js'/.test(read('install.mjs')), 'install.mjs file list')
+if (typeof clientExport === 'string' && fs.existsSync(path.join(HERE, clientExport))) {
+  const client = read(clientExport)
+  // The loader registers factories by module id, and `<bare id>` must resolve to
+  // the same exports as `<bare id>/client` — a mismatched id here is a bundle
+  // that loads and never activates.
+  check('the bundle registers under the package name', client.includes(`id: '${manifest.name}'`), manifest.name)
+  check('…and the module id uses the bare name, not a scoped path', !client.includes(`id: '${manifest.name}/client'`))
+}
+
+console.log('\n── 6. manifest references resolve ────────────────────────')
+// A manifest is a set of promises about files, and the installer keeps its own
+// hand-written copy list. The two have already drifted once: `files` and
+// `dsh.bundle.patch` both name `cordis.patch.yml` while the copy list omitted
+// it, so a manual install produced a package whose own manifest pointed at a
+// file that was not there. Neither half fails loudly on its own.
+//
+// These compare the manifest against the *source* checkout, the only place the
+// full `files` list and `install.mjs` coexist (an installed copy deliberately
+// receives the runtime and the tests, not the docs or the installer).
+// `install.mjs` is repo-only, so its presence is the signal.
+if (!fs.existsSync(path.join(HERE, 'install.mjs'))) {
+  console.log('  skip  source-checkout checks: installed copy (no install.mjs)')
+} else {
+  const shipped = manifest.files ?? []
+  const missingFromDisk = shipped.filter((entry) => !fs.existsSync(path.join(HERE, entry)))
+  check('every file package.json ships exists on disk', missingFromDisk.length === 0, `missing=${missingFromDisk.join(',')}`)
+
+  const installerList = (read('install.mjs').match(/const files = \[([^\]]*)\]/)?.[1] ?? '')
+    .split(',')
+    .map((entry) => entry.trim().replace(/^['"]|['"]$/g, ''))
+    .filter(Boolean)
+  const referenced = [manifest.main, manifest.dsh?.bundle?.patch, ...Object.values(manifest.exports ?? {})]
+    .filter((value) => typeof value === 'string' && value.startsWith('./'))
+    .map((value) => value.slice(2))
+  check('the manifest references at least one file', referenced.length > 0, JSON.stringify(referenced))
+  const notCopied = referenced.filter((entry) => !installerList.includes(entry))
+  check('the installer copies every file the manifest references', notCopied.length === 0, `not copied=${notCopied.join(',')}`)
+  check(
+    '…including the bundle patch the loader row consumes',
+    installerList.includes('cordis.patch.yml') && referenced.includes('cordis.patch.yml'),
+    JSON.stringify({ referenced, installerList }),
+  )
+}
+
 console.log(`\nRESULT: ${failures.length === 0 ? 'PACKAGE OK' : `FAILED (${failures.join(' | ')})`}`)
 process.exit(failures.length === 0 ? 0 : 2)

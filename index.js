@@ -72,6 +72,82 @@ export const KEY_REF = 'CLINE_PASS_API_KEY'
 export const PROFILE_PATH = '/api/v1'
 
 /**
+ * The ClinePass usage-limits endpoint, as a path below `upstream`.
+ *
+ * Cline's own dashboard reads this path; it is **not** in the public Enterprise
+ * API reference, so the shape is pinned by `normalizeUsage` and by
+ * `test-usage.mjs` rather than by documentation. CodexBar
+ * (github.com/steipete/CodexBar, MIT) is the reference implementation this
+ * matches: `GET`, no body, no query.
+ */
+export const USAGE_PATH = '/api/v1/users/me/plan/usage-limits'
+
+/**
+ * The one Fetch route the browser half reads usage through.
+ *
+ * Registered on dsh's **existing** `/api` channel (`ctx.connection.fetch`),
+ * which the web server already owns: this adds a path, never a listener, a
+ * port, or a socket. The channel applies dsh's own Host/Origin trust fence and
+ * browser-cookie authentication before the handler runs, and only the usage
+ * numbers ever travel back — the key is read on this side and never returned.
+ */
+export const USAGE_ROUTE = '/api/clinepass.usage'
+
+/**
+ * The `globalThis` name the browser half reads `{ usageRoute }` from.
+ *
+ * The route is configurable, and the client half has to fetch the same path —
+ * so the host announces it through the web server's own index-injection table
+ * (the same mechanism `dsh-client-connection` uses for its recovery timing)
+ * rather than letting the two halves drift with a hard-coded coincidence.
+ */
+export const USAGE_BOOT_GLOBAL = '__DSH_CLINEPASS__'
+
+/**
+ * The windows Cline reports, in the order the card shows them.
+ *
+ * Cline's payload names them `five_hour` / `weekly` / `monthly`; an unknown
+ * `type` is skipped rather than rendered (CodexBar does the same, and Cline has
+ * shipped experimental pool types before).
+ */
+export const USAGE_WINDOWS = ['five_hour', 'weekly', 'monthly']
+
+const DEFAULT_USAGE_TIMEOUT_MS = 15_000
+const DEFAULT_USAGE_CACHE_MS = 60_000
+
+/**
+ * How long a *failed* read is remembered.
+ *
+ * Successes are cached for `usageCacheMs`, but without this a persistent failure
+ * (no network, gateway down, no key) costs one gateway round trip per card
+ * mount — every entry into the Models pane. Short enough that fixing the key and
+ * looking again is honest: the card also forces a refresh when the stored key
+ * changes, so it never has to wait this out.
+ */
+const USAGE_ERROR_CACHE_MS = 5_000
+
+/**
+ * Resolve to `promise`'s value, or to a `timeout` failure after `ms`.
+ *
+ * Applied to the *whole* read rather than only to the gateway call inside it:
+ * `credentials.resolve` is outside that signal, and a provider that never
+ * settles would otherwise hold the dedupe slot open forever.
+ *
+ * @param promise - the read to bound.
+ * @param ms - the budget.
+ * @returns the read's result, or a synthetic timeout failure.
+ */
+function withDeadline(promise, ms) {
+  let timer
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, reason: 'timeout', message: `the usage read did not finish within ${ms} ms` }), ms)
+    // Never hold the host process open on behalf of a usage read.
+    timer.unref?.()
+  })
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer))
+}
+
+/**
  * Marks a wrapper as ours, carrying the fetch it replaced.
  *
  * Re-mounting a plugin in one process (a reload, an HMR pass) would otherwise
@@ -89,6 +165,21 @@ const DEFAULT_MAX_TOKENS = 131072
 function positiveInteger(value, fallback) {
   const number = typeof value === 'number' ? value : typeof value === 'string' && /^\d+$/.test(value.trim()) ? Number(value) : Number.NaN
   return Number.isSafeInteger(number) && number > 0 ? number : fallback
+}
+
+/**
+ * Coerce a configured number to a non-negative integer.
+ *
+ * Usage caching is the one knob where `0` is meaningful — it means "always
+ * refetch" — so `positiveInteger` is the wrong coercer for it.
+ *
+ * @param value - the configured value.
+ * @param fallback - what an unreadable value becomes.
+ * @returns the value, or the fallback.
+ */
+function nonNegativeInteger(value, fallback) {
+  const number = typeof value === 'number' ? value : typeof value === 'string' && /^\d+$/.test(value.trim()) ? Number(value) : Number.NaN
+  return Number.isSafeInteger(number) && number >= 0 ? number : fallback
 }
 
 /** True for a plain object (not null, not an array). */
@@ -165,6 +256,10 @@ export function withDefaults(raw, logger = console) {
     provision: raw?.provision !== false,
     alignReasoningEffort: raw?.alignReasoningEffort !== false,
     plainModelId: raw?.plainModelId !== false,
+    usage: raw?.usage !== false,
+    usageRoute: text(raw?.usageRoute, USAGE_ROUTE),
+    usageTimeoutMs: positiveInteger(raw?.usageTimeoutMs, DEFAULT_USAGE_TIMEOUT_MS),
+    usageCacheMs: nonNegativeInteger(raw?.usageCacheMs, DEFAULT_USAGE_CACHE_MS),
     statusFile: raw?.statusFile === false ? false : typeof raw?.statusFile === 'string' && raw.statusFile.length > 0 ? raw.statusFile : true,
     ignoredOptions: ignored,
   }
@@ -291,6 +386,253 @@ export async function alignReasoningEffort(settings, cfg, logger = console) {
     logger.warn?.('[clinepass] could not align the stored reasoning effort: %s', error instanceof Error ? error.message : String(error))
     return 'failed'
   }
+}
+
+/**
+ * Read one reset timestamp into a canonical ISO string, or null.
+ *
+ * The live endpoint answers with **nanosecond** precision
+ * (`2026-09-16T11:38:00.490486029Z`). V8 parses that today, but it is outside
+ * what `Date` is specified to accept, and the string is handed to a browser —
+ * so this side (which is always Node) normalises it to milliseconds once and
+ * the browser never has to be lenient.
+ *
+ * @param value - the `resetsAt` the endpoint sent.
+ * @returns an ISO-8601 string, or null when there is none or it is unreadable.
+ */
+function resetInstant(value) {
+  if (typeof value !== 'string' || value.length === 0) return null
+  const at = new Date(value)
+  return Number.isNaN(at.getTime()) ? null : at.toISOString()
+}
+
+/**
+ * Reduce the usage-limits payload to the three windows the card renders.
+ *
+ * Nothing here trusts the response: `success` must be exactly `true`,
+ * `data.limits` must be an array, `percentUsed` must be a finite number
+ * (clamped to 0–100), and a window is dropped when it is unreadable rather than
+ * rendered as a wrong number. Unknown window types are skipped — Cline has
+ * shipped experimental pool types that this card does not claim to understand.
+ *
+ * `percentUsed` is **used**, not remaining; the card turns it into a bar and a
+ * remaining figure itself.
+ *
+ * @param payload - the parsed response body.
+ * @returns `{ ok: true, limits }` or `{ ok: false, problem }`.
+ */
+export function normalizeUsage(payload) {
+  if (!isPlainObject(payload)) return { ok: false, problem: 'the response is not a JSON object' }
+  if (payload.success !== true) return { ok: false, problem: 'the response did not report success' }
+  const raw = isPlainObject(payload.data) ? payload.data.limits : undefined
+  if (!Array.isArray(raw)) return { ok: false, problem: 'the response carries no limits array' }
+  const limits = []
+  for (const type of USAGE_WINDOWS) {
+    const entry = raw.find((candidate) => isPlainObject(candidate) && candidate.type === type)
+    if (entry === undefined) continue
+    const percent = typeof entry.percentUsed === 'number' && Number.isFinite(entry.percentUsed) ? entry.percentUsed : Number.NaN
+    if (Number.isNaN(percent)) continue
+    limits.push({ type, percentUsed: Math.min(100, Math.max(0, percent)), resetsAt: resetInstant(entry.resetsAt) })
+  }
+  return { ok: true, limits }
+}
+
+/**
+ * Fetch this account's usage limits from the gateway.
+ *
+ * The key is used for exactly one thing — the `Authorization` header of this
+ * request — and is never logged, cached, or returned. Failure is a *value*, not
+ * a throw: every branch is something the card can render ("no key", "rejected",
+ * "rate limited", "gateway down"), and a broken usage reader must never be able
+ * to take the route down with it.
+ *
+ * The request deliberately bypasses the pin hook's concerns (it is not a
+ * chat-completions call, so the hook passes it through untouched).
+ *
+ * @param cfg - the complete plugin configuration.
+ * @param apiKey - the resolved credential value.
+ * @param options - `fetch` override (tests) and an abort signal.
+ * @returns `{ ok: true, limits }` or `{ ok: false, reason, message, status? }`.
+ */
+export async function fetchUsage(cfg, apiKey, options = {}) {
+  const fetchImpl = options.fetch ?? globalThis.fetch
+  if (typeof fetchImpl !== 'function') return { ok: false, reason: 'network', message: 'no fetch implementation is available' }
+  const url = `${cfg.upstream}${USAGE_PATH}`
+  const timeoutMs = positiveInteger(cfg.usageTimeoutMs, DEFAULT_USAGE_TIMEOUT_MS)
+  // `AbortSignal.timeout` is Node 17.3+ and the engines floor is Node 20, but a
+  // hand-supplied signal (tests) wins, and a runtime without it still gets a
+  // request rather than a crash.
+  const signal =
+    options.signal ??
+    (typeof AbortSignal === 'function' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(timeoutMs) : undefined)
+  let response
+  try {
+    response = await fetchImpl(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+      signal,
+    })
+  } catch (error) {
+    const aborted = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')
+    return {
+      ok: false,
+      reason: aborted ? 'timeout' : 'network',
+      message: aborted ? `the gateway did not answer within ${timeoutMs} ms` : 'could not reach the gateway',
+    }
+  }
+  const status = response.status
+  if (status === 401 || status === 403) {
+    return { ok: false, reason: 'unauthorized', status, message: 'the gateway rejected the API key; re-enter it on Settings → Models' }
+  }
+  if (status === 429) return { ok: false, reason: 'rate-limited', status, message: 'the gateway is rate limiting usage reads; try again shortly' }
+  if (status >= 500) return { ok: false, reason: 'unavailable', status, message: `the gateway answered ${status}` }
+  if (status !== 200) return { ok: false, reason: 'http', status, message: `the gateway answered ${status}` }
+  let payload
+  try {
+    payload = await response.json()
+  } catch (error) {
+    // The timeout covers the body too: a gateway that sends 200 + headers and
+    // then stalls the body aborts *here*, not at the fetch. Reporting that as
+    // "not JSON" would send the user hunting for a malformed gateway.
+    const aborted = signal?.aborted === true || (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError'))
+    if (aborted) {
+      return { ok: false, reason: 'timeout', status, message: `the gateway did not finish answering within ${timeoutMs} ms` }
+    }
+    return { ok: false, reason: 'parse', status, message: 'the gateway answered with something that is not JSON' }
+  }
+  const normalized = normalizeUsage(payload)
+  if (!normalized.ok) return { ok: false, reason: 'parse', status, message: normalized.problem }
+  return { ok: true, limits: normalized.limits }
+}
+
+/**
+ * Build the usage route handler.
+ *
+ * One successful read is cached for `usageCacheMs` and shared between
+ * concurrent callers, so opening the settings page (and every re-render of the
+ * card) does not turn into a burst of gateway calls. Failures are deliberately
+ * **not** cached: fixing the key in the editor must take effect on the next
+ * look, not after a minute.
+ *
+ * `?refresh=1` bypasses the cache — that is the card's refresh button.
+ *
+ * @param routeCtx - the context the `connection` and `credentials` services resolved in.
+ * @param cfg - the complete plugin configuration.
+ * @param logger - where to report an unexpected failure.
+ * @param options - a `fetch` override, threaded to {@link fetchUsage} (tests).
+ * @returns the Fetch handler.
+ */
+export function createUsageHandler(routeCtx, cfg, logger = console, options = {}) {
+  let cache = null
+  let inflight = null
+
+  const json = (body, status = 200) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+    })
+
+  async function read() {
+    const credentials = routeCtx.credentials ?? routeCtx.get?.('credentials')
+    if (credentials === undefined || typeof credentials.resolve !== 'function') {
+      return { ok: false, reason: 'no-credentials', message: 'this dsh has no credential store to read the API key from' }
+    }
+    const resolved = await credentials.resolve(cfg.apiKeyEnv)
+    if (resolved === undefined || typeof resolved.value !== 'string' || resolved.value.length === 0) {
+      return { ok: false, reason: 'no-key', message: `no key is stored for ${cfg.apiKeyEnv}; enter it on Settings → Models` }
+    }
+    const result = await fetchUsage(cfg, resolved.value, options)
+    return result.ok ? { ...result, fetchedAt: new Date().toISOString() } : result
+  }
+
+  /**
+   * One read, deduplicated against any read already in flight.
+   *
+   * The whole read — credential lookup included — is raced against the timeout,
+   * not just the gateway call inside it: a credential provider whose `resolve`
+   * never settles would otherwise wedge this slot forever, and every later
+   * request (the refresh button included) would join the same dead promise.
+   */
+  async function load(force, waitMs) {
+    const now = Date.now()
+    const holdMs = nonNegativeInteger(cfg.usageCacheMs, DEFAULT_USAGE_CACHE_MS)
+    if (!force && cache !== null && now - cache.at < (cache.body.ok ? holdMs : USAGE_ERROR_CACHE_MS)) {
+      return cache.body
+    }
+    if (inflight === null) {
+      inflight = (async () => {
+        try {
+          const body = await withDeadline(read(), waitMs)
+          // Successes are cached for as long as configured; failures only long
+          // enough to absorb a user flipping between settings panes, so a fixed
+          // key still takes effect on the next deliberate look (and the card
+          // forces a refresh when the stored key changes).
+          cache = { at: Date.now(), body }
+          return body
+        } finally {
+          inflight = null
+        }
+      })()
+    }
+    return inflight
+  }
+
+  return async (request) => {
+    let force = false
+    try {
+      force = new URL(request.url).searchParams.get('refresh') === '1'
+    } catch {
+      // An unreadable URL is simply not a forced refresh.
+    }
+    try {
+      const waitMs = positiveInteger(cfg.usageTimeoutMs, DEFAULT_USAGE_TIMEOUT_MS)
+      return json(await load(force, waitMs))
+    } catch (error) {
+      logger.warn?.('[clinepass] the usage read failed unexpectedly: %s', error instanceof Error ? error.message : String(error))
+      return json({ ok: false, reason: 'internal', message: 'the usage read failed inside dsh; see the dsh log' }, 500)
+    }
+  }
+}
+
+/**
+ * Publish the usage route on dsh's existing `/api` channel.
+ *
+ * Mounted only once both `connection` (the route registry) and `credentials`
+ * (where the key lives) exist, which is why it is a `ctx.inject` child rather
+ * than part of `apply`: a headless profile has neither, and a pending child
+ * fiber is how that stays a no-op instead of an error. Nothing here opens a
+ * listener — `ctx.connection.fetch.register` adds one path to the HTTP server
+ * dsh already runs, behind dsh's own trust fence and browser cookie.
+ *
+ * @param routeCtx - context carrying `connection` and `credentials`.
+ * @param cfg - the complete plugin configuration.
+ * @param logger - where to report.
+ * @returns `'installed' | 'failed'`.
+ */
+export function installUsageRoute(routeCtx, cfg, logger = console) {
+  const connection = routeCtx.connection ?? routeCtx.get?.('connection')
+  const registry = connection?.fetch
+  if (registry === undefined || typeof registry.register !== 'function') {
+    logger.warn?.('[clinepass] no connection.fetch registry; the usage card will not load')
+    return 'failed'
+  }
+  try {
+    registry.register({
+      path: cfg.usageRoute,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: createUsageHandler(routeCtx, cfg, logger),
+    })
+  } catch (error) {
+    logger.warn?.(
+      '[clinepass] could not register the usage route %s: %s',
+      cfg.usageRoute,
+      error instanceof Error ? error.message : String(error),
+    )
+    return 'failed'
+  }
+  logger.info?.('[clinepass] usage for Settings → Models is served at %s (a path on dsh\'s own server, no listener of ours)', cfg.usageRoute)
+  return 'installed'
 }
 
 /**
@@ -989,6 +1331,41 @@ export async function apply(ctx, config) {
     } else {
       provision = await provisionProfile(settings, cfg, logger)
       if (cfg.alignReasoningEffort) await alignReasoningEffort(settings, cfg, logger)
+    }
+  }
+
+  // `pending` until the child fiber below reports, `off` when the option is
+  // disabled; only `installed` is announced as a route the browser may call.
+  let mounted = cfg.usage ? 'pending' : 'off'
+
+  // The announcement is unconditional, and that is the point: the browser half
+  // is loaded from `package.json`, not from this config, so `usage: false` does
+  // not remove the card from the page — it only stops the host mounting the
+  // route. Without this the card would then GET an unregistered path, get a 404
+  // page, and tell the user "could not reach the gateway" forever. Announcing
+  // `enabled: false` lets it render nothing instead, which is what the option
+  // has always claimed to do.
+  //
+  // `ctx.on` is owned by this fiber, so a reload re-registers it and an unload
+  // removes it. The event fires only where a web server renders a page, which is
+  // also why `webServer` is not injected: a headless composition is unaffected.
+  ctx.on?.('webserver/index-inject', (table) => {
+    table.push({ kind: 'global', name: USAGE_BOOT_GLOBAL, value: { usageRoute: mounted === 'installed' ? cfg.usageRoute : null, enabled: mounted === 'installed' } })
+  })
+
+  // The usage card is a web-only extra: it needs the route registry (where the
+  // path is published) and the credential store (where the key lives), so it is
+  // mounted through a child fiber that simply stays pending in a profile that
+  // has neither. It changes nothing about the pin.
+  if (cfg.usage) {
+    if (typeof ctx.inject !== 'function') {
+      // A context double, or a host that predates `ctx.inject`: the pin is
+      // unaffected, so this is a warning rather than a failed activation.
+      logger.warn?.('[clinepass] this context cannot inject services; the Settings → Models usage card was not mounted')
+    } else {
+      ctx.inject(['connection', 'credentials'], (routeCtx) => {
+        mounted = installUsageRoute(routeCtx, cfg, logger)
+      })
     }
   }
 

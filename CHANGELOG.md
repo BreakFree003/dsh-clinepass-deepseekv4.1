@@ -1,5 +1,152 @@
 # Changelog
 
+## 0.7.0
+
+**The plugin grows a browser half: a usage card on Settings → Models. The pin,
+the profile provisioning, the prompt rewrite and the wire body are untouched.**
+
+Added:
+
+- **Usage on the Cline Pass card.** The three ClinePass windows — 5-hour, weekly,
+  monthly — render as progress bars of what is **left**, with the remaining
+  percent, the reset countdown, a refresh button and the read time, inside the
+  provider card on Settings → Models. `usage: false` turns the whole thing off.
+  The gateway only reports `percentUsed` — the live response carries no `limit`,
+  `used` or `remaining` field — so remaining is `100 − percentUsed`, rounded to
+  one decimal in the browser half (`100 − 82.4` must not print
+  `17.599999999999994`) and clamped so an exhausted window reads `0%`. The host
+  keeps the wire field exactly as the gateway named it: the flip is presentation,
+  and the bar width, the bar colour and the number are one quantity, never a
+  "18% left" label over an 82%-filled bar. The title spells out "remaining"
+  because the number itself is bare.
+- **`client.js`**, the browser half. It registers into dsh's documented
+  `settings.models.provider-card` slot (keyed by the `llm-pi-ai` settings
+  namespace) and returns `null` on every card that is not `cline-pass`, so other
+  pi-ai routes are unaffected. No build step and no new dependency: it is a
+  hand-written bundle in the same style as `dsh-notify-ping`, and the only module
+  it asks for is React, which the web shell's static table already provides.
+- **The host-side read.** `GET https://api.cline.bot/api/v1/users/me/plan/usage-limits`
+  with `Authorization: Bearer <key>` and `Accept: application/json` — the same
+  endpoint CodexBar (MIT) uses. Live-verified against the real gateway on
+  2026-09-16: `{"success":true,"data":{"limits":[{"type":"five_hour",
+  "percentUsed":1,"resetsAt":"2026-09-16T11:38:00.490486029Z"}, …]}}`.
+  - `normalizeUsage` refuses anything it does not understand rather than drawing
+    a wrong bar: `success` must be exactly `true`, `percentUsed` must be a finite
+    number (clamped to 0–100), an unknown window `type` is skipped, and
+    `resetsAt` is normalised host-side to millisecond ISO because the gateway
+    sends **nanosecond** precision that the `Date` spec does not promise a
+    browser will accept.
+  - The key is read from the credential store on the host and used for exactly
+    one header. It is never logged, cached, or returned; the response carries
+    numbers only.
+- **`/api/clinepass.usage`** — one exact Fetch route, registered through
+  `ctx.connection.fetch.register` on the HTTP server dsh **already runs**.
+  This is a new *path*, not a new listener, port or socket: the plugin still
+  opens nothing. The route sits behind dsh's own Host/Origin trust fence and
+  browser-cookie authentication. One successful read is cached for
+  `usageCacheMs` (default 60 s) and concurrent reads are deduplicated. A *failed*
+  read is remembered for 5 s — long enough that flipping between settings panes
+  while the gateway is down does not re-hit it, short enough that a fixed key
+  takes effect immediately, and the card forces a refresh when the stored key
+  changes so it never waits that window out. The whole read (credential lookup
+  included) is bounded by `usageTimeoutMs`, not just the gateway call.
+- **Options**: `usage` (default `true`), `usageRoute`
+  (default `/api/clinepass.usage`), `usageTimeoutMs` (default 15000),
+  `usageCacheMs` (default 60000; `0` means always refetch).
+- `test-usage.mjs`, a zero-network suite over the normaliser, the gateway read,
+  the route handler (caching, dedupe, failure classification, key containment)
+  and the `apply` wiring. It also **renders `client.js`** against a ~60-line
+  stand-in React runtime (React is not a dependency of this package and must not
+  become one), asserting the card's real output in both languages, its failure
+  copy, its timer discipline and its unmount path. The runtime runs effect
+  cleanups, so deleting one is a test failure rather than a silent leak. `test-package.mjs` now also pins the client-half declaration,
+  because a wrong `exports["./client"]` or `dsh.client.platform` would leave the
+  host working while the card silently never appears.
+
+Fixed:
+
+- **`ctx.locale` needs to be declared in `inject`.** The first cut declared only
+  `slots`, on the assumption that an unavailable locale would come back
+  `undefined` and the card would fall back to English. Cordis does not work that
+  way: an *undeclared* service property **throws**
+  (`cannot get property "locale" without inject`), the throw landed inside the
+  slot's error boundary, and the card rendered as an empty
+  `<div data-slot-error="settings.models.provider-card">` — installed,
+  activated, no visible error, nothing on screen. The declaration is now
+  `['slots', 'locale']`, `test-usage.mjs` statically asserts that every service
+  the bundle touches is declared (the render test cannot catch this class of bug,
+  because the guard lives in the real context proxy), and the live-shell check
+  that found it was a headless browser reading the actual DOM.
+- **The rest of the round, found by three independent reviews of this change.**
+  The pin, the provisioning, the prompt rewrite and the wire body are still
+  untouched; everything below is inside the usage feature.
+  - **`usage: false` did not turn the card off.** The browser half is discovered
+    from `package.json`, so it loads whatever the config says; disabling only
+    stopped the host registering the route, and the card then fetched a path
+    nobody served, got a 404 page, and reported "could not reach the gateway"
+    forever — with a Retry button that could never fix it. The README even
+    recommended this as a diagnostic. The host now always announces, with
+    `enabled: false` when the route is not mounted, and the card renders nothing.
+    It also refuses to advertise a route whose registration *failed*.
+  - **One malformed `limits` entry could retire the card permanently.** The slot
+    wraps an entry in an error boundary that renders an invisible empty `div`;
+    for a keyed slot the cell is then spent, so a `null` element (or a
+    non-numeric, `null` or `NaN` `percentUsed`, which rendered a green 0-width
+    bar reading `NaN%`) removed the card for the rest of the page session with
+    no explanation. Limits are now narrowed per entry, and rows are selected by
+    `WINDOWS` rather than by whatever the response happened to contain.
+  - **Every browser-side failure said "could not reach the gateway".** `fetch`
+    resolving is not success: a non-JSON body, a 404 or a proxied 502 all fell
+    into one catch. Failures are now classified by status, so a missing route
+    says so instead of blaming the network.
+  - **The card could wedge on "Loading…" forever.** The host bounds only its own
+    leg to the gateway, and the refresh button is disabled while loading, so a
+    hung dsh left no clickable control at all. There is now a 20 s client-side
+    abort mapped to the timeout copy.
+  - **A stalled response body was reported as malformed JSON.** An abort during
+    `response.json()` was classified `parse`; it is now `timeout`.
+  - **The dedupe slot could wedge.** `credentials.resolve` sat outside the
+    gateway timeout, so a provider that never settled held the slot open and the
+    refresh button — which joins the same promise — could not escape it. The
+    whole read is now bounded.
+  - **A 30 s timer on every pi-ai provider card.** The countdown ticker started
+    before the `isOurs` early return, so each unrelated provider row (and every
+    row that had nothing to count down) ran an idle interval. It is now created
+    only for this card. Host side the feature adds **no** timer: the only
+    recurring one in the plugin is the pre-existing 30 s fetch-ownership check.
+  - **The installer omitted `cordis.patch.yml`**, which the copied
+    `package.json` references via `dsh.bundle.patch` and `exports` — a manual
+    install produced a manifest pointing at a missing file. Pre-existing, fixed
+    here, and `test-package.mjs` now asserts that every referenced file exists
+    and is copied.
+  - **`npm test` could not run in an installed copy.** Its `test` script names
+    `test-package.mjs` and `test-install.mjs`, neither of which the installer
+    copies (both need the source checkout — one reads `CHANGELOG.md`, the other
+    tests the installer). Pre-existing, and the copy is still byte-identical to
+    the repo, so the fix is a `test:installed` script naming the three suites
+    that do run anywhere.
+  - **Three tests could not fail.** Cache expiry had no test at all (pinning the
+    window to 60× passed), effect cleanups were never run (deleting both
+    `client.js` cleanups passed), and the suite was locale-dependent — it failed
+    under `sv_SE` and `de_DE` because an assertion scanned the browser-formatted
+    date. All three are now covered by tests proven to fail under mutation.
+
+Notes:
+
+- The browser cannot read the key by design (dsh's credential seam is
+  write-only: "no read path returns it"), which is *why* the card needs a host
+  half. Do not "simplify" this into a browser-side fetch — it cannot work, and
+  the fallback would be putting the key in the DOM.
+- Only web profiles mount the card: it is registered through a child fiber that
+  stays pending when `connection` / `credentials` are absent, so a headless
+  profile is unaffected.
+- `usageRoute` and the client's path cannot drift: the host announces the
+  configured path through the web server's own `webserver/index-inject` table,
+  and the client only falls back to the default when no page render carried it.
+- The card speaks the shell's language; the strings are written into `client.js`
+  rather than registered as a locale namespace, so a missing dictionary can never
+  blank the card.
+
 ## 0.6.2
 
 **One new behavior, one new option — the pin hook, the profile provisioning and

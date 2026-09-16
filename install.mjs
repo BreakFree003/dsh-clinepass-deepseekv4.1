@@ -80,7 +80,10 @@ if (!fs.existsSync(profileDir)) {
 const targetDir = path.join(profileDir, 'plugins', name)
 const patchPath = path.join(profileDir, 'cordis.patch.yml')
 const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-const files = ['index.js', 'package.json', 'test-fetch.mjs', 'test-settings.mjs', 'smoke-test.mjs']
+// `cordis.patch.yml` is here because the copied `package.json` references it —
+// `dsh.bundle.patch` and `exports["./cordis.patch.yml"]` — so leaving it out
+// ships a manifest that points at a file the directory does not contain.
+const files = ['index.js', 'client.js', 'package.json', 'cordis.patch.yml', 'test-fetch.mjs', 'test-settings.mjs', 'test-usage.mjs', 'smoke-test.mjs']
 
 /** The loader row: the pin is injected in-process, so nothing listens. */
 const FETCH_BLOCK = `# ── dsh-clinepass ─────────────────────────────────────────────────────────

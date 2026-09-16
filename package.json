@@ -1,22 +1,25 @@
 {
   "name": "dsh-clinepass",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "Cline Pass for DeepSeek Harness: an OpenAI-compatible provider route whose requests are pinned to the DeepSeek upstream channel, with the API key entered on Settings → Models.",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
+    "client.js",
     "cordis.patch.yml",
     "install.mjs",
     "uninstall.mjs",
     "smoke-test.mjs",
     "test-fetch.mjs",
     "test-settings.mjs",
+    "test-usage.mjs",
     "test-install.mjs",
     "patch.example.yml",
     "test-package.mjs",
@@ -26,10 +29,12 @@
     "patch-file.mjs"
   ],
   "scripts": {
-    "test": "node test-package.mjs && node test-fetch.mjs && node test-settings.mjs && node test-install.mjs",
+    "test": "node test-package.mjs && node test-fetch.mjs && node test-settings.mjs && node test-usage.mjs && node test-install.mjs",
+  "test:installed": "node test-fetch.mjs && node test-settings.mjs && node test-usage.mjs",
     "test:package": "node test-package.mjs",
     "test:fetch": "node test-fetch.mjs",
     "test:settings": "node test-settings.mjs",
+    "test:usage": "node test-usage.mjs",
     "test:install": "node test-install.mjs",
     "smoke": "node smoke-test.mjs"
   },
@@ -56,6 +61,9 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "engines": {
