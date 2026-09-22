@@ -1012,6 +1012,10 @@ console.log('\n── 13. the streaming gate ───────────�
   // 看 startsWith('[DONE]')），会把这一帧丢给 JSON.parse 让整条流报错。扣帧范围要和消费者一致。
   check('…but only with the spacing the consumer accepts', !isTerminatorFrame(enc('data:  [DONE]\n\n')))
   check('the frame splitter accepts CR-only blank lines', nextFrameEnd(enc('data: {}\r\rrest')) === 'data: {}\r\r'.length)
+  check('a terminator without a trailing blank line is still a terminator', isTerminatorFrame(enc('data: [DONE]')))
+  // 裸 `data` 行也会被拼进负载（消费者一样），于是拼接结果以 `\n[DONE]` 开头 —— 这一帧对
+  // 双方都不是终止帧。锁住这个方向，免得哪天「更严」悄悄变成「更松」。
+  check('a bare `data` line before it makes it not a terminator', !isTerminatorFrame(enc('data\rdata: [DONE]\r\r')))
   check('content frames are never mistaken for a terminator', !isTerminatorFrame(enc('data: {"a":1}\n\n')))
 }
 
@@ -1168,7 +1172,8 @@ console.log('\n── 14. the streamed gate, attacked ────────�
     const hook = createFetchPin({}, recorder())
     hook.install()
     const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    check('a duplicated terminator still ends in one clean completion', error === null && text(bytes).includes('[DONE]'), String(error?.message ?? 'none'))
+    const doneCount = (text(bytes).match(/\[DONE\]/g) ?? []).length
+    check('a duplicated terminator yields exactly one [DONE] and nothing after it', error === null && doneCount === 1 && text(bytes).endsWith('data: [DONE]\n\n'), `count=${doneCount}, tail=${JSON.stringify(text(bytes)).slice(-40)}`)
     hook.uninstall()
     stub.restore()
   }
@@ -1251,6 +1256,70 @@ console.log('\n── 14. the streamed gate, attacked ────────�
     hook.install()
     const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
     check('a CR-separated violation withholds its terminator too', error !== null && !text(bytes).includes('[DONE]'), `blocked=${hook.counters.blocked}, detail=${String(error?.detail ?? 'none')}`)
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 状态文件里记的必须是**被拒的那一处** routing：伪造者把一个自称「由允许渠道提供」的
+  // routing 放在最后，不能连「谁服务了这次请求」这个诊断也一起改掉。
+  {
+    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('alibaba'), routingFrame('deepseek'), 'data: [DONE]\n\n'])))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    check('the recorded culprit is the rejected routing, not the last one', hook.state().lastViolation?.finalProvider === 'alibaba', JSON.stringify(hook.state().lastViolation ?? null).slice(0, 110))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 缓冲（非 SSE）路径同样逐处判，并记下被拒的那一处。
+  {
+    const wireText = `data: ${gatewayBody('alibaba')}\n\ndata: ${gatewayBody('deepseek')}\n\n`
+    const stub = stubFetch(() => new Response(wireText, { status: 200, headers: { 'content-type': 'application/json' } }))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const response = await globalThis.fetch(CHAT, jsonInit())
+    const body = await response.text()
+    check('the buffered path judges every routing too', response.status === 400 && /PROVIDER_PIN_VIOLATION/.test(body), `HTTP ${response.status}`)
+    check('…and records the rejected one', hook.state().lastViolation?.finalProvider === 'alibaba', JSON.stringify(hook.state().lastViolation ?? null).slice(0, 110))
+    check('…while its 400 body carries no gateway-supplied slug', !/alibaba/.test(JSON.parse(body).error.message) && JSON.parse(body).error.allowed.join() === 'deepseek', body.slice(0, 120))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 一个 JSON 被拆到两行 `data:`：消费者拼接后能解析，插件也必须解析 —— 否则那一处 foreign
+  // routing 根本不会被看到（复审用真实适配器把整条路径跑通过）。
+  {
+    const full = gatewayBody('alibaba')
+    const cut = full.indexOf(',') + 1
+    const splitFrame = `data: ${full.slice(0, cut)}\ndata: ${full.slice(cut)}\n\n`
+    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('deepseek'), splitFrame, 'data: [DONE]\n\n'])))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    check('a routing split across two data: lines is judged', error !== null && hook.counters.blocked === 1, `blocked=${hook.counters.blocked}, detail=${String(error?.detail ?? 'none')}`)
+    check('…and its terminator is withheld', !text(bytes).includes('[DONE]'))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 终止帧一到就收尾 —— 上游 body 该被放掉，别让 socket 挂着。
+  {
+    let cancelled = false
+    const stub = stubFetch(() => sse(new ReadableStream({
+      start(controller) {
+        controller.enqueue(enc(delta(0)))
+        controller.enqueue(enc(routingFrame('deepseek')))
+        controller.enqueue(enc('data: [DONE]\n\n'))
+      },
+      cancel() {
+        cancelled = true
+      },
+    })))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    check('the upstream body is released once the verdict is in', cancelled)
     hook.uninstall()
     stub.restore()
   }

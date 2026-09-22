@@ -806,24 +806,44 @@ function collectRouting(node, out = []) {
  * 在网关的 routing 之后再塞一个自称「由允许渠道提供」的 routing，把判决改成它想要的那个。
  * 只信最后一处，等于把结论交给被审的一方。规则：**任何一处指向别家就拒**。
  *
- * 行分隔符按 SSE 规范算 `/[
-\n]/`：只认 `\n` 会漏掉 CR 分隔的响应，而消费者是认的。
+ * 行分隔符按 SSE 规范算，且**按事件组装**：同一事件里的多个 `data:` 行要用 `\n` 拼接后再解析
+ * —— 只逐行 parse 会漏掉「一个 JSON 被拆到两行 data:」这种合法写法，而消费者看得懂。
  *
  * @param text - 响应体原文（SSE 或单个 JSON 文档）。
  * @returns 去重后的 routing 对象数组，可能为空。
  */
 export function routingsOfText(text) {
   const raw = []
-  for (const line of String(text).split(/[\r\n]/)) {
-    if (!line.startsWith('data:')) continue
-    const data = line.slice(5).trim()
-    if (data === '' || data === '[DONE]') continue
+  const take = (data) => {
+    if (data.trim() === '' || data.trim() === '[DONE]') return
     try {
       collectRouting(JSON.parse(data), raw)
     } catch {
       // 半截帧：SSE 允许，跳过。
     }
   }
+  // 按**事件**组装，而不是逐行 parse：同一事件里的多个 `data:` 行要先用 `\n` 拼起来才是
+  // 它的负载（消费者的做法：`data.join('\n')`）。一个 JSON 被拆到两行 `data:` 是完全合法的
+  // SSE —— 逐行 parse 会两边都失败，那一处 routing 就**根本不会被看到**。
+  let data = []
+  const flush = () => {
+    if (data.length === 0) return
+    take(data.join('\n'))
+    // 再逐行试一次：`data: [DONE]` 和 routing 挤在**同一个事件**里时，消费者拼接后只看
+    // 前缀是 [DONE] 就收工（那一行后面的 JSON 它根本不解析），但那些字节仍然是我们**保留
+    // 并转发**的 —— 里面藏着什么必须一并过闸。更严只会 fail closed，不会放行。
+    if (data.length > 1) for (const line of data) take(line)
+    data = []
+  }
+  for (const line of String(text).split(/\r\n|\r|\n/)) {
+    if (line === '') {
+      flush()
+      continue
+    }
+    if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''))
+    else if (line === 'data') data.push('')
+  }
+  flush()
   if (raw.length === 0) {
     try {
       collectRouting(JSON.parse(String(text)), raw)
@@ -929,14 +949,16 @@ function isEventStream(response) {
 export function judgeRoutings(routings, allowed) {
   const list = Array.isArray(routings) ? routings : []
   if (list.length === 0) {
-    return { ok: false, reason: '响应里没有 gateway.routing 元数据，无法证明它由允许的渠道提供', seen: 0 }
+    return { ok: false, reason: '响应里没有 gateway.routing 元数据，无法证明它由允许的渠道提供', seen: 0, culprit: null }
   }
   let first = null
   for (const routing of list) {
     const verdict = judgeRouting(routing, allowed)
     if (!verdict.ok) {
       const note = list.length > 1 ? `（这条响应里出现了 ${list.length} 处 routing，逐处都查了）` : ''
-      return { ...verdict, seen: list.length, reason: verdict.reason + note }
+      // 把**被拒的那一处**带出去：状态文件里必须记它。否则伪造者能用一个自称「由允许渠道
+      // 提供」的 routing，把「这次是谁服务的」这个诊断也一并改掉。
+      return { ...verdict, seen: list.length, reason: verdict.reason + note, culprit: routing }
     }
     first ??= verdict
   }
@@ -1080,6 +1102,9 @@ export function isTerminatorFrame(frame) {
   const lines = []
   for (const line of new TextDecoder().decode(frame).split(/[\r\n]/)) {
     if (line.startsWith('data:')) lines.push(line.slice(5).replace(/^ /, ''))
+    // 裸 `data` 行是**空**数据字段，不是「没有这一行」：它会把拼接结果顶成 `\n…`，消费者
+    // 因此不认为这是终止帧。少认这一个会让「我们扣住了、它报错了」两边对不上。
+    else if (line === 'data') lines.push('')
   }
   return lines.length > 0 && lines.join('\n').startsWith('[DONE]')
 }
@@ -1333,7 +1358,7 @@ export function createFetchPin(config, logger = console) {
       recordVerified(url, verdict, allowed)
       return bufferedResponse(text, response)
     }
-    recordViolation(verdict.reason, allowed, routings.length === 0 ? null : routings[routings.length - 1])
+    recordViolation(verdict.reason, allowed, verdict.culprit ?? null)
     if (cfg.enforcement === 'warn') return bufferedResponse(text, response)
     return refusalResponse(verdict.reason, allowed)
   }
@@ -1368,22 +1393,35 @@ export function createFetchPin(config, logger = console) {
    */
   function streamedVerification(response, allowed, url, signal) {
     const holdTerminator = cfg.enforcement === 'strict'
+    /** 保留的 routing 处数上界：正常响应只有一处，超界按「无法证明」处理。 */
+    const MAX_ROUTINGS = 64
     const decoder = new TextDecoder()
     let reader = null
     let pending = new Uint8Array(0)
     const routings = []
     const seenRouting = new Set()
+    let routingOverflow = false
     let sourceEnded = false
     let concluded = false
     let cancelled = false
 
     /** 按背压向上游要字节；第一次真正要数据时才把 body 锁成 reader。 */
     const source = () => (reader ??= response.body.getReader())
-    /** 记下这一帧里出现的**每一处** routing（去重；内存不随响应长度增长）。 */
+    /**
+     * 记下这一帧里出现的**每一处** routing（按内容去重）。
+     *
+     * 去重只挡完全相同的重复；一个渠道仍能造出无数个各不相同的 routing 对象，而这是整个
+     * 响应里唯一会随长度增长的内存。上界取得很宽松（正常响应只有一处），超界就按「无法证明」
+     * 处理（见 conclude），不再继续攒。
+     */
     const note = (frame) => {
       for (const routing of routingsOfText(decoder.decode(frame))) {
         const key = JSON.stringify(routing)
         if (seenRouting.has(key)) continue
+        if (seenRouting.size >= MAX_ROUTINGS) {
+          routingOverflow = true
+          continue
+        }
         seenRouting.add(key)
         routings.push(routing)
       }
@@ -1401,14 +1439,16 @@ export function createFetchPin(config, logger = console) {
       concluded = true
       // 判决做完了，上游剩下的字节不再需要（消费者也在 [DONE] 处停了）：顺手放掉 socket。
       if (reader !== null) reader.cancel().catch(() => {})
-      const verdict = judgeRoutings(routings, allowed)
+      const verdict = routingOverflow
+        ? { ok: false, reason: `响应里出现了超过 ${MAX_ROUTINGS} 处各不相同的 routing 元数据，无法证明它由允许的渠道提供`, culprit: null }
+        : judgeRoutings(routings, allowed)
       if (verdict.ok) {
         recordVerified(url, verdict, allowed)
         if (heldFrame !== null) controller.enqueue(heldFrame)
         controller.close()
         return
       }
-      recordViolation(verdict.reason, allowed, routings.length === 0 ? null : routings[routings.length - 1])
+      recordViolation(verdict.reason, allowed, verdict.culprit ?? null)
       if (!holdTerminator) {
         // warn：终止帧早就放行了，这里只需要收尾。
         controller.close()

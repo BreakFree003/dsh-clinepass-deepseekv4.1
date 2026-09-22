@@ -44,6 +44,31 @@ Changed:
   nothing judges afterwards, and the read loop stops; a cancelled body can no
   longer be written to (the `cancelled` flag is belt-and-braces on top of that,
   since `concluded` alone already covers the paths a test can drive).
+
+A third review re-attacked the result and found three more, all fixed here:
+
+- **The status file could name the attacker as the culprit.** The violation
+  record was built from the *last* routing object while the verdict may have
+  rejected an earlier one, so a forged "deepseek" object after a real "alibaba"
+  one made `lastViolation.finalProvider` read `deepseek` — the exact field the
+  README tells operators to check. `judgeRoutings` now returns the routing it
+  rejected, and that is what gets recorded.
+- **A routing whose JSON is split across two `data:` lines of one event was not
+  judged.** The consumer joins an event's data lines with `\n` before parsing
+  (`openai/core/streaming.js`), the plugin parsed each line on its own, so both
+  halves failed and the object was invisible — reproduced end to end through the
+  real pi-ai adapter, foreign content assembled with `blocked: 0`. Routing
+  extraction now assembles events the way the consumer does, and still scans each
+  data line separately as well, because a frame carrying both `[DONE]` and a
+  routing object is one the consumer stops at but the gate keeps and forwards.
+- **The retained-routing set was unbounded.** Deduplication only removes exact
+  repeats, so a channel could emit many distinct routing objects (~1 KB each) and
+  grow memory linearly. Capped at 64 distinct objects; past that the response
+  counts as unprovable.
+
+The terminator predicate also treats a bare `data` line as an empty data field
+(it joins to `\n[DONE]` and is therefore *not* a terminator), matching the
+consumer exactly.
 - The wrapper works on **bytes**: frames are split on the SSE blank line
   (`\n\n`, `\r\n\r\n` and `\r\r`, matching the SDK's own
   `findDoubleNewlineIndex`) and decoded only to read `routing`, so the forwarded
