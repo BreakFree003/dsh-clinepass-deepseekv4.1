@@ -40,7 +40,10 @@ Changed:
 - **A cancel is never a verdict.** When the consumer stops reading (user presses
   stop, or dsh aborts the round), `routing` has usually not arrived yet, so the
   old code could reach `conclude` on a cancelled stream and record a *false*
-  violation. Cancellation now records `unverified` instead and never judges.
+  violation. `cancel()` now records `unverified`, marks the stream concluded so
+  nothing judges afterwards, and the read loop stops; a cancelled body can no
+  longer be written to (the `cancelled` flag is belt-and-braces on top of that,
+  since `concluded` alone already covers the paths a test can drive).
 - The wrapper works on **bytes**: frames are split on the SSE blank line
   (`\n\n`, `\r\n\r\n` and `\r\r`, matching the SDK's own
   `findDoubleNewlineIndex`) and decoded only to read `routing`, so the forwarded
@@ -53,14 +56,35 @@ Changed:
   internal close algorithm and surfaces as an *uncaught exception* when nobody is
   reading concurrently, which took the host process down (found by
   `smoke-test.mjs`).
-- The refusal message is checked against dsh's failure classifier before it is
-  thrown. `classifyPiAiError` is a set of regexes over the message, and channel
-  names come from the gateway: a slug containing `429`, `rate_limit`, `500`,
-  `timeout` or `connection` would classify as retryable and make a request that
-  is refused every time be streamed `maxRetries` times. The fixed part of the
-  message was already safe; now the interpolated part is too — if it collides,
-  the error carries a static message and the diagnostic stays in the log and
-  `lastViolation`.
+- **The refusal message is a constant with no gateway-supplied text in it.** A
+  second review found that the first attempt at this only mirrored
+  `classifyPiAiError`: `mapStopReason` runs pi-ai's context-overflow patterns and
+  the harness's `isContextWindowExceededError`/`isQuotaExceededError` *before* it,
+  and `CONTEXT_WINDOW_EXCEEDED` makes dsh-compaction **prune and compact the
+  session** and retry. A channel slug like `context_length_exceeded` or
+  `insufficient-balance` therefore still steered the harness. Mirroring several
+  sets of patterns is exactly the kind of thing that drifts (the first mirror was
+  already wrong in two places), so the message now contains nothing dynamic at
+  all: the culprit goes to the plugin log, `lastViolation`, and a `detail`
+  property on the error instead. Pinned by a test that runs five adversarial
+  slugs and asserts the message is byte-identical every time.
+- **Every `routing` object in the response is judged, not just the last one.**
+  Also from the second review: a channel controls the frames it emits, so it can
+  append a routing claiming to be an allowed provider and, under last-wins, be
+  believed — a forged `deepseek` object after a real `alibaba` one produced a
+  clean foreign completion through the real client. The rule is now "any routing
+  that names a foreign provider rejects the response"; the regression test fails
+  against the previous revision.
+- **The verdict no longer waits for upstream EOF.** If upstream sends
+  `[DONE]` and keeps the connection open, the held terminator used to stay held
+  until the stream idle timeout (the client waited 1.5 s in a probe; production
+  would wait 300 s). A terminator now ends the response — which is what the
+  consumer does with it too — and the upstream body is cancelled.
+- CR is treated as a line terminator everywhere (`\r`, `\n`, `\r\n`, matching
+  the SDK), including the terminator predicate and routing extraction. A
+  `[DONE]` preceded by a CR was previously forwarded instead of held, so the
+  "terminator is never released on a violation" guarantee did not actually hold
+  for that framing.
 - `verifyPinned` passes the caller's abort signal into the streaming path, and
   the upstream body is locked into a reader lazily (only once bytes are actually
   wanted) rather than eagerly.

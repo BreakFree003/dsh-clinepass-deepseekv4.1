@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import { createFetchPin, installPromptDisplay, isGatewayChat, isRetryableFailureText, isTerminatorFrame, nextFrameEnd, provisionProfile, statusFileFor, withDefaults } from './index.js'
+import { createFetchPin, installPromptDisplay, isGatewayChat, isTerminatorFrame, nextFrameEnd, provisionProfile, routingOfText, statusFileFor, withDefaults } from './index.js'
 
 // The hook publishes a status file by default; keep every run's out of the
 // user's real DSH_HOME (and let the default resolution be what is exercised).
@@ -316,7 +316,7 @@ console.log('\n── 4b. the local gate ─────────────
   const muteHook = createFetchPin({}, recorder())
   muteHook.install()
   const mute = await globalThis.fetch(CHAT, jsonInit())
-  check('a response with no routing metadata is refused', mute.status === 400 && /没有 gateway\.routing 元数据/.test(await mute.text()), `HTTP ${mute.status}`)
+  check('a response with no routing metadata is refused', mute.status === 400 && /PROVIDER_PIN_VIOLATION/.test(await mute.text()), `HTTP ${mute.status}`)
   muteHook.uninstall()
 
   // 非 2xx 原样放行：那是失败的调用，改写它会掩盖配额/限流。
@@ -333,7 +333,11 @@ console.log('\n── 4b. the local gate ─────────────
   const splitHook = createFetchPin({}, recorder())
   splitHook.install()
   const split = await globalThis.fetch(CHAT, jsonInit())
-  check('a disagreeing resolvedProvider is refused', split.status === 400 && /resolvedProvider=alibaba/.test(await split.text()), `HTTP ${split.status}`)
+  check(
+    'a disagreeing resolvedProvider is refused',
+    split.status === 400 && /PROVIDER_PIN_VIOLATION/.test(await split.text()) && /resolvedProvider=alibaba/.test(String(splitHook.state().lastViolation?.reason)),
+    `HTTP ${split.status}: ${String(splitHook.state().lastViolation?.reason)}`,
+  )
   splitHook.uninstall()
 
   // 恢复顺序必须**逆序**：每个 stub 记下的 `real` 是它创建时的那个 fetch，
@@ -964,7 +968,7 @@ console.log('\n── 13. the streaming gate ───────────�
     const hook = createFetchPin({}, recorder())
     hook.install()
     const { text, error } = await drain(await globalThis.fetch(CHAT, jsonInit()))
-    check('a streamed response with no routing metadata is refused', error !== null && /没有 gateway\.routing 元数据/.test(error.message), String(error?.message))
+    check('a streamed response with no routing metadata is refused', error !== null && /没有 gateway\.routing 元数据/.test(String(error?.detail)), String(error?.message))
     check('…and its terminator is withheld too', !text.includes('[DONE]'), JSON.stringify(text))
     hook.uninstall()
     stub.restore()
@@ -1071,7 +1075,7 @@ console.log('\n── 14. the streamed gate, attacked ────────�
     const hook = createFetchPin({}, recorder())
     hook.install()
     const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    check('routing inside the held terminator frame is judged too', error !== null && /finalProvider=alibaba/.test(error.message), String(error?.message ?? '').slice(0, 90))
+    check('routing inside the held terminator frame is judged too', error !== null && /finalProvider=alibaba/.test(String(error?.detail)), `${String(error?.message ?? '').slice(0, 60)} | ${String(error?.detail ?? '')}`)
     check('…so a hidden channel blocks the call', hook.counters.blocked === 1, JSON.stringify(hook.counters))
     check('…and an earlier allowed routing does not excuse it', !text(bytes).includes('[DONE]'), JSON.stringify(text(bytes)).slice(-70))
     hook.uninstall()
@@ -1134,14 +1138,37 @@ console.log('\n── 14. the streamed gate, attacked ────────�
     stub.restore()
   }
 
-  // 两帧 [DONE]：都扣住、通过后一起放行（`hold` 的拼接分支此前没被覆盖）。
+  // 上游发完 [DONE] 却不关连接：不能等到它关流才放行终止帧（实测客户端会一直等到空闲
+  // 超时）。第一帧 [DONE] 就是这次响应的结尾 —— 消费者也是这么认的。
+  {
+    let upstreamClosed = false
+    const stub = stubFetch(() => sse(new ReadableStream({
+      start(controller) {
+        controller.enqueue(enc(delta(0)))
+        controller.enqueue(enc(routingFrame('deepseek')))
+        controller.enqueue(enc('data: [DONE]\n\n'))
+        // 故意不 close：模拟「网关发完却不关连接」。
+        void (async () => { await new Promise((resolve) => setTimeout(resolve, 5000)); upstreamClosed = true; controller.close() })()
+      },
+    })))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const started = Date.now()
+    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    const took = Date.now() - started
+    check('the terminator is released without waiting for upstream EOF', error === null && text(bytes).includes('[DONE]') && took < 1000, `${took}ms, upstreamClosed=${upstreamClosed}, error=${String(error?.message ?? 'none')}`)
+    check('…and the verdict was still reached', hook.state().lastVerified?.provider === 'deepseek')
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 两帧 [DONE]：第一帧就收尾（不再读第二帧），消费者照样拿到一个完整的终止帧。
   {
     const stub = stubFetch(() => sse(wire([delta(0), routingFrame('deepseek'), 'data: [DONE]\n\n', 'data: [DONE]\n\n'])))
     const hook = createFetchPin({}, recorder())
     hook.install()
     const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    const seen = (text(bytes).match(/\[DONE\]/g) ?? []).length
-    check('two terminator frames are both held and released together', error === null && seen === 2, `seen=${seen}, error=${String(error?.message ?? 'none')}`)
+    check('a duplicated terminator still ends in one clean completion', error === null && text(bytes).includes('[DONE]'), String(error?.message ?? 'none'))
     hook.uninstall()
     stub.restore()
   }
@@ -1152,7 +1179,7 @@ console.log('\n── 14. the streamed gate, attacked ────────�
     const hook = createFetchPin({}, recorder())
     hook.install()
     const response = await globalThis.fetch(CHAT, jsonInit())
-    check('an SSE response with no body fails closed with 400', response.status === 400 && /没有 gateway\.routing/.test(await response.text()), `HTTP ${response.status}`)
+    check('an SSE response with no body fails closed with 400', response.status === 400 && /PROVIDER_PIN_VIOLATION/.test(await response.text()), `HTTP ${response.status}`)
     hook.uninstall()
     stub.restore()
   }
@@ -1201,25 +1228,52 @@ console.log('\n── 14. the streamed gate, attacked ────────�
     stub.restore()
   }
 
-  // 对抗性渠道名：dsh 用正则从错误文案里给失败分类，`channel-500` / `rate_limit` 会被
-  // 归成 SERVER / RATE_LIMIT（都可重试），于是同一条注定被拒的请求被打 8 遍。
+  // 伪造的 routing 盖在真 routing **之后**：只信「最后一处」就等于把判决交给被审的一方 ——
+  // 服务这次请求的渠道控制着自己那部分帧，可以自称 deepseek 把真话盖掉。
   {
-    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('channel-500')])))
+    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('alibaba'), routingFrame('deepseek'), 'data: [DONE]\n\n'])))
     const hook = createFetchPin({}, recorder())
     hook.install()
-    const { error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    check('an adversarial channel name stays out of the classified message', error !== null && !/channel-500/.test(error.message), String(error?.message ?? '').slice(0, 90))
-    check('…so the refusal cannot be classified as retryable', error !== null && !isRetryableFailureText(error.message), String(error?.message ?? '').slice(0, 90))
-    check('…while the raw culprit is still recorded', hook.state().lastViolation?.finalProvider === 'channel-500', JSON.stringify(hook.state().lastViolation ?? null).slice(0, 90))
-    check(
-      'the guard detects exactly the retryable keywords',
-      isRetryableFailureText('provider=channel-500') &&
-        isRetryableFailureText('provider=rate_limit') &&
-        isRetryableFailureText('provider=fetch-timeout') &&
-        !isRetryableFailureText('finalProvider=alibaba，允许的是 deepseek'),
-    )
+    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    check('a forged allowed routing cannot override a real foreign one', error !== null && hook.counters.blocked === 1, `blocked=${hook.counters.blocked}, detail=${String(error?.detail ?? 'none')}`)
+    check('…and its terminator is withheld', !text(bytes).includes('[DONE]'), JSON.stringify(text(bytes)).slice(-60))
     hook.uninstall()
     stub.restore()
+  }
+
+  // CR 单独作行分隔符（SSE 规范允许，消费者也认）：终止帧判定与 routing 提取都要跟上，
+  // 否则「我们以为转发了、它以为结束了」，或反过来漏读元数据。
+  {
+    check('a CR-separated terminator is recognised', isTerminatorFrame(enc('x\rdata: [DONE]\r\r')))
+    check('a CR-separated routing frame is read', routingOfText(`data: ${gatewayBody('deepseek')}\r\r`)?.finalProvider === 'deepseek')
+    const stub = stubFetch(() => sse(wire([delta(0), `data: ${gatewayBody('alibaba')}\r\r`, 'data: [DONE]\r\r'])))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    check('a CR-separated violation withholds its terminator too', error !== null && !text(bytes).includes('[DONE]'), `blocked=${hook.counters.blocked}, detail=${String(error?.detail ?? 'none')}`)
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // dsh 会在错误文案上跑好几套判定（重试分类、上下文溢出 → **会话压缩**、配额），而渠道名
+  // 来自网关。所以拒绝文案必须**与网关输入无关**：换任何渠道名，文案都要逐字相同。
+  // 这里不去镜像那几套正则（镜像必然滞后，第一版就是这么漏的），直接钉住「不插值」。
+  {
+    const messages = new Map()
+    for (const slug of ['alibaba', 'channel-500', 'context_length_exceeded', 'insufficient-balance', 'rate_limit']) {
+      const stub = stubFetch(() => sse(wire([delta(0), routingFrame(slug)])))
+      const hook = createFetchPin({}, recorder())
+      hook.install()
+      const { error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+      messages.set(slug, { message: error?.message ?? '', detail: error?.detail ?? '', recorded: hook.state().lastViolation?.finalProvider ?? null })
+      hook.uninstall()
+      stub.restore()
+    }
+    const all = [...messages.values()].map((entry) => entry.message)
+    const first = all[0]
+    check('the refusal message does not depend on the channel name at all', all.every((message) => message === first), `${new Set(all).size} distinct messages`)
+    check('…so no channel name can steer any classifier reading it', all.every((message) => !/alibaba|channel-500|context_length_exceeded|insufficient-balance|rate_limit/.test(message)), first.slice(0, 80))
+    check('…while the culprit still reaches the diagnostic channels', [...messages.entries()].every(([slug, entry]) => entry.detail.includes(slug) && entry.recorded === slug), JSON.stringify([...messages.entries()].map(([slug, entry]) => [slug, entry.recorded])).slice(0, 140))
   }
 }
 

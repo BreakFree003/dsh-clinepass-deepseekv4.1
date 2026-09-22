@@ -799,34 +799,61 @@ function collectRouting(node, out = []) {
 }
 
 /**
- * 从一次响应的原文里取出 routing 元数据。
+ * 从一次响应里取出**所有** routing 对象（去重，保持出现顺序）。
  *
- * 流式响应里 routing 在**最后一帧**（带 `finish_reason` 的那帧）才出现，所以调用方
- * 必须先缓冲整条响应才能判断 —— 这正是 `strict` 模式要缓冲的原因。
+ * 为什么是「每一处」而不是「最后一处」：`routing` 通常是网关写在最后那一帧，但同一个响应
+ * 体里的字节**也流经被审的那一方** —— 服务这次请求的渠道控制着自己那部分帧的结构，于是可以
+ * 在网关的 routing 之后再塞一个自称「由允许渠道提供」的 routing，把判决改成它想要的那个。
+ * 只信最后一处，等于把结论交给被审的一方。规则：**任何一处指向别家就拒**。
+ *
+ * 行分隔符按 SSE 规范算 `/[
+\n]/`：只认 `\n` 会漏掉 CR 分隔的响应，而消费者是认的。
  *
  * @param text - 响应体原文（SSE 或单个 JSON 文档）。
- * @returns 最后一个 routing 对象，没有则 null。
+ * @returns 去重后的 routing 对象数组，可能为空。
  */
-export function routingOfText(text) {
-  const found = []
-  for (const line of String(text).split('\n')) {
+export function routingsOfText(text) {
+  const raw = []
+  for (const line of String(text).split(/[\r\n]/)) {
     if (!line.startsWith('data:')) continue
     const data = line.slice(5).trim()
     if (data === '' || data === '[DONE]') continue
     try {
-      collectRouting(JSON.parse(data), found)
+      collectRouting(JSON.parse(data), raw)
     } catch {
       // 半截帧：SSE 允许，跳过。
     }
   }
-  if (found.length === 0) {
+  if (raw.length === 0) {
     try {
-      collectRouting(JSON.parse(String(text)), found)
+      collectRouting(JSON.parse(String(text)), raw)
     } catch {
       // 不是 JSON：下面按「没有元数据」处理。
     }
   }
-  return found.length === 0 ? null : found[found.length - 1]
+  const seen = new Set()
+  const unique = []
+  for (const routing of raw) {
+    const key = JSON.stringify(routing)
+    if (seen.has(key)) continue
+    seen.add(key)
+    unique.push(routing)
+  }
+  return unique
+}
+
+/**
+ * {@link routingsOfText} 里最后出现的那一处。
+ *
+ * 单处 routing 的响应（网关今天的形态）用这个足够；判定请用 {@link judgeRoutings}，
+ * 它会逐处都查。
+ *
+ * @param text - 响应体原文。
+ * @returns 最后一个 routing 对象，没有则 null。
+ */
+export function routingOfText(text) {
+  const all = routingsOfText(text)
+  return all.length === 0 ? null : all[all.length - 1]
 }
 
 /**
@@ -889,17 +916,31 @@ function isEventStream(response) {
 }
 
 /**
- * 把「这一帧里读到的 routing」判成结论。读不到元数据就是**不可证明** —— 与读出一个
- * 不允许的渠道同等处理（fail closed），否则网关哪天不再发元数据就等于自动放行。
+ * 逐处判定这次响应里的 routing。**任何一处**指向别家就整条拒 —— 这个响应体里出现过
+ * 「别家服务」的说法，无论出现在哪一帧，都不该被另一处的说法盖过去。
  *
- * @param routing - {@link routingOfText} 的最后一个结果，或 null。
+ * 读不到任何元数据同样是**不可证明**，与读出一个不允许的渠道同等处理（fail closed），
+ * 否则网关哪天不再发元数据就等于自动放行。
+ *
+ * @param routings - {@link routingsOfText} 的返回值。
  * @param allowed - 允许的渠道列表。
- * @returns {@link judgeRouting} 的结论，或「没有元数据」的拒绝。
+ * @returns `{ ok: true, provider, attempts, seen }` 或 `{ ok: false, reason, seen }`。
  */
-function verdictOf(routing, allowed) {
-  return routing === null
-    ? { ok: false, reason: '响应里没有 gateway.routing 元数据，无法证明它由允许的渠道提供' }
-    : judgeRouting(routing, allowed)
+export function judgeRoutings(routings, allowed) {
+  const list = Array.isArray(routings) ? routings : []
+  if (list.length === 0) {
+    return { ok: false, reason: '响应里没有 gateway.routing 元数据，无法证明它由允许的渠道提供', seen: 0 }
+  }
+  let first = null
+  for (const routing of list) {
+    const verdict = judgeRouting(routing, allowed)
+    if (!verdict.ok) {
+      const note = list.length > 1 ? `（这条响应里出现了 ${list.length} 处 routing，逐处都查了）` : ''
+      return { ...verdict, seen: list.length, reason: verdict.reason + note }
+    }
+    first ??= verdict
+  }
+  return { ...first, seen: list.length }
 }
 
 /**
@@ -932,7 +973,7 @@ function bufferedResponse(text, response) {
  * @returns 400 响应。
  */
 function refusalResponse(reason, allowed) {
-  const message = refusalMessage(reason, false)
+  const message = refusalMessage(false)
   return new Response(
     JSON.stringify({ error: { code: 'PROVIDER_PIN_VIOLATION', type: 'provider_pin_violation', message, allowed } }),
     {
@@ -944,7 +985,16 @@ function refusalResponse(reason, allowed) {
 }
 
 /**
- * 违规文案。
+ * 违规文案。**一个字都不来自网关**。
+ *
+ * dsh 会在错误文案上跑**多个**判定：`mapStopReason` 先用 pi-ai 的上下文溢出模式与
+ * `isContextWindowExceededError`，再是配额，最后才是 `classifyPiAiError`。它们决定要不要
+ * 重试，溢出那条**还会触发会话压缩**。渠道名由网关给 —— 把被审方的字符串喂给裁判，就是给
+ * 对手改判词的机会：一个叫 `context_length_exceeded` 的渠道名足以让 dsh 去压缩你的会话。
+ * 所以 message 只放固定文案，诊断（含渠道名）走三处不参与判定的地方：插件日志、
+ * 状态文件的 `lastViolation`、错误对象的 `detail` 属性。**不要试图给 message 加护栏正则**：
+ * 判定有好几套、随时会增补，护栏必然滞后；这里的保证是「message 里没有任何动态内容」，
+ * 由测试用「换任何渠道名文案都必须逐字相同」来钉住。
  *
  * 流式与缓冲两种拒法的后果不同，文案必须说清：缓冲（非流式响应）时内容从未离开网关；
  * 流式时内容已经边流边显示过，只是在**装配之前**把这次调用作废了 —— 模型上下文里没有
@@ -953,45 +1003,14 @@ function refusalResponse(reason, allowed) {
  * 同样刻意避开 rate / timeout / network / 5xx 这类关键词：dsh 用正则给 pi-ai 的失败
  * 分类，命中就会被默认重试策略当成可重试错误。
  *
- * @param reason - 判定失败的说明。
  * @param streamed - 是否是「已经流出去过」的那条路径。
  * @returns 展示给用户的文案。
  */
-function refusalMessage(reason, streamed) {
+function refusalMessage(streamed) {
   const tail = streamed
     ? '这次调用已作废：内容没有进入模型上下文、工具也不会执行（可能已在窗口里闪现）。enforcement=strict；想只告警就设 enforcement: "warn"。'
     : '已丢弃这条响应、没有交给模型（enforcement=strict；想只告警就设 enforcement: "warn"）。'
-  const message = `cline-pass 渠道校验未通过：${reason}。${tail}`
-  if (!isRetryableFailureText(message)) return message
-  // 动态部分（渠道名来自网关）撞上了可重试关键词：换成不含它的文案。宁可少一句诊断，
-  // 也别让一条注定被拒的请求按 maxRetries 重打 —— 诊断原文在日志与 lastViolation 里。
-  return `cline-pass 渠道校验未通过：响应不是由允许的渠道提供。${tail}（具体渠道见状态文件的 lastViolation 与日志）`
-}
-
-/**
- * dsh 判断失败能不能重试，靠的是在错误文案上跑一遍正则（`classifyPiAiError`）。命中
- * `RATE_LIMIT` / `SERVER` / `TIMEOUT` / `TRANSPORT` 这几类，就会按 `maxRetries` 重打 ——
- * 对一条注定被拒的请求，那是白花 8 次调用。
- *
- * 静态文案是自己写的、可控；**渠道名来自网关**，理论上可能带着 `rate`、`timeout`、`500`
- * 这类字样。所以拼好的文案再过一遍同样的判定，命中就退回不含动态部分的版本。
- *
- * 这些模式是 `dsh-llm-pi-ai` 里 `classifyPiAiError` 的镜像：它哪天加了新词，这里最坏只是
- * 漏网（退回今天的行为），不会把本来安全的文案变成危险的。
- */
-const RETRYABLE_FAILURE_TEXT =
-  /\b(?:401|403|413|400|429)\b|\b5\d\d\b|rate.?limit|quota|invalid.?request|payload too large|request body too large|time(?:d)?\s*out|timeout|stream ended (?:before|without)|network|connection|socket|fetch|ECONN[A-Z]+|other side closed|premature close|terminated|websocket closed unexpectedly|http2 request did not get a response/i
-
-/**
- * 这段文案会不会被 dsh 当成「可重试的失败」。
- *
- * 导出只为测试；真实用途是给 `refusalMessage` 当护栏。
- *
- * @param text - 待判定的错误文案。
- * @returns 会被分类成可重试失败时为 true。
- */
-export function isRetryableFailureText(text) {
-  return RETRYABLE_FAILURE_TEXT.test(String(text))
+  return `cline-pass 渠道校验未通过：响应不是由允许的渠道提供（哪个渠道见状态文件的 lastViolation 与 dsh 日志）。${tail}`
 }
 
 /**
@@ -1003,15 +1022,17 @@ export function isRetryableFailureText(text) {
  * —— 于是工具不会执行。注意**终止帧必须扣住**：只要 `data: [DONE]` 先到了消费者手里，
  * 适配器就会当成正常收尾去装配消息，那时候再报错已经晚了。
  *
- * @param reason - 判定失败的说明。
+ * @param reason - 判定失败的说明（只放进 `detail` 与日志，**不进 message**）。
  * @param allowed - 允许的渠道列表。
  * @returns 抛进响应流的错误。
  */
 function refusalError(reason, allowed) {
-  const error = new Error(refusalMessage(reason, true))
+  const error = new Error(refusalMessage(true))
   error.name = 'ClinePassPinViolation'
   error.code = 'PROVIDER_PIN_VIOLATION'
   error.allowed = [...allowed]
+  // 诊断走属性，不走 message：message 会被 dsh 拿去分类（重试、甚至触发会话压缩）。
+  error.detail = reason
   return error
 }
 
@@ -1052,10 +1073,15 @@ export function nextFrameEnd(pending) {
  * @returns 是否是终止帧。
  */
 export function isTerminatorFrame(frame) {
-  // `data:` 后**最多一个空格** —— 这正是 openai 解码器的判定（它剥掉 `data:` 和一个可选
-  // 空格后看 `startsWith('[DONE]')`）。宽一格就会把它眼里的「坏帧」当成终止帧扣下来，
-  // 通过裁决后又原样放回去，消费者那边照样先报 JSON 解析错。
-  return /(?:^|\n)data: ?\[DONE\]/.test(new TextDecoder().decode(frame))
+  // 规则要和**消费者**逐字一致，否则会出现「我们以为扣住了、它以为结束了」这种错位：
+  // openai 的解码器把一帧里的多个 `data:` 行用 `\n` 拼起来，再只看 `startsWith('[DONE]')`，
+  // 而它的行分隔符是 `\r`、`\n` 或 `\r\n`。所以这里也是「拼数据行、判前缀」，
+  // 不是在任意一行里搜 `[DONE]`，也不只认 `\n` 开头的行。
+  const lines = []
+  for (const line of new TextDecoder().decode(frame).split(/[\r\n]/)) {
+    if (line.startsWith('data:')) lines.push(line.slice(5).replace(/^ /, ''))
+  }
+  return lines.length > 0 && lines.join('\n').startsWith('[DONE]')
 }
 
 /** 拼接字节块。帧很小（一条 delta），朴素的重新分配足够，不值得为它引入分片列表。 */
@@ -1296,18 +1322,18 @@ export function createFetchPin(config, logger = console) {
       recordViolation(reason, allowed, null)
       return refusalResponse(reason, allowed)
     }
-    let routing = null
+    let routings = []
     try {
-      routing = routingOfText(text)
+      routings = routingsOfText(text)
     } catch {
-      routing = null
+      routings = []
     }
-    const verdict = verdictOf(routing, allowed)
+    const verdict = judgeRoutings(routings, allowed)
     if (verdict.ok) {
       recordVerified(url, verdict, allowed)
       return bufferedResponse(text, response)
     }
-    recordViolation(verdict.reason, allowed, routing)
+    recordViolation(verdict.reason, allowed, routings.length === 0 ? null : routings[routings.length - 1])
     if (cfg.enforcement === 'warn') return bufferedResponse(text, response)
     return refusalResponse(verdict.reason, allowed)
   }
@@ -1345,83 +1371,95 @@ export function createFetchPin(config, logger = console) {
     const decoder = new TextDecoder()
     let reader = null
     let pending = new Uint8Array(0)
-    let held = null
-    let routing = null
+    const routings = []
+    const seenRouting = new Set()
     let sourceEnded = false
     let concluded = false
     let cancelled = false
 
     /** 按背压向上游要字节；第一次真正要数据时才把 body 锁成 reader。 */
     const source = () => (reader ??= response.body.getReader())
-    /** 记下一帧里读到的 routing（只留最后一个，内存不随响应增长）。 */
+    /** 记下这一帧里出现的**每一处** routing（去重；内存不随响应长度增长）。 */
     const note = (frame) => {
-      const found = routingOfText(decoder.decode(frame))
-      if (found !== null) routing = found
-    }
-    /** 扣住终止帧。正常情况下只有一帧；真出现第二帧就一并扣住，宁可最后一起放行。 */
-    const hold = (frame) => {
-      held = held === null ? frame : concatBytes(held, frame)
+      for (const routing of routingsOfText(decoder.decode(frame))) {
+        const key = JSON.stringify(routing)
+        if (seenRouting.has(key)) continue
+        seenRouting.add(key)
+        routings.push(routing)
+      }
     }
     /**
-     * 处理一帧：先读它的 routing，再决定转发还是扣住。
-     *
-     * `note()` **必须在扣帧之前**：扣住的是「留着待放」的字节，不是丢弃的字节 —— 网关若
-     * 把 routing 和 [DONE] 写进同一帧（多行 `data:` 是合法 SSE），漏扫就等于拿上一帧的旧
-     * 结论替它背书，闸会放行一条别家提供的响应。
+     * 收尾：裁决，然后放行扣住的那一帧，或按违规中断响应体。
      *
      * @param controller - 下游流的控制器。
-     * @param frame - 一帧原始字节。
-     * @returns 已放行（true）还是扣住（false）。
+     * @param heldFrame - 被扣住的终止帧（没有终止帧就不传）。
      */
-    const emitFrame = (controller, frame) => {
-      note(frame)
-      if (holdTerminator && isTerminatorFrame(frame)) {
-        hold(frame)
-        return false
-      }
-      controller.enqueue(frame)
-      return true
-    }
-    /** 源已结束：裁决，然后放行终止帧收尾，或按违规中断。 */
-    const conclude = (controller) => {
+    const conclude = (controller, heldFrame = null) => {
       // 下游已经取消（用户按停止）就没有「收尾」可言：这时候 routing 往往还没到，
       // 硬判会得到一条**假的违规**。取消由 cancel() 记成 unverified。
       if (concluded || cancelled) return
       concluded = true
-      const verdict = verdictOf(routing, allowed)
+      // 判决做完了，上游剩下的字节不再需要（消费者也在 [DONE] 处停了）：顺手放掉 socket。
+      if (reader !== null) reader.cancel().catch(() => {})
+      const verdict = judgeRoutings(routings, allowed)
       if (verdict.ok) {
         recordVerified(url, verdict, allowed)
-        if (held !== null) controller.enqueue(held)
+        if (heldFrame !== null) controller.enqueue(heldFrame)
         controller.close()
         return
       }
-      recordViolation(verdict.reason, allowed, routing)
+      recordViolation(verdict.reason, allowed, routings.length === 0 ? null : routings[routings.length - 1])
       if (!holdTerminator) {
-        if (held !== null) controller.enqueue(held)
+        // warn：终止帧早就放行了，这里只需要收尾。
         controller.close()
         return
       }
       // 扣住的终止帧就此丢掉：消费者看到的是流中断，而不是一次正常收尾。
       controller.error(refusalError(verdict.reason, allowed))
     }
+    /**
+     * 处理一帧：先读它的每一处 routing，再决定转发还是扣住。
+     *
+     * `note()` **必须在扣帧之前**：扣住的是「留着待放」的字节，不是丢弃的字节 —— 里面装着
+     * routing 而不扫，就等于拿别处的结论替它背书。
+     *
+     * 终止帧一到就收尾，**不等上游关流**：消费者在 `[DONE]` 处就结束了，等下去只会在
+     * 「网关发完却不关连接」时把这一轮吊到空闲超时（实测客户端一直等不到 `[DONE]`）。
+     *
+     * @param controller - 下游流的控制器。
+     * @param frame - 一帧原始字节。
+     */
+    const emitFrame = (controller, frame) => {
+      note(frame)
+      if (!isTerminatorFrame(frame)) {
+        controller.enqueue(frame)
+        return
+      }
+      if (holdTerminator) conclude(controller, frame)
+      else {
+        controller.enqueue(frame)
+        conclude(controller)
+      }
+    }
 
     const body = new ReadableStream({
       async pull(controller) {
         for (;;) {
+          // 取消是「消费者不要了」：不能再往上游要数据，也不能再往一个已取消的流里塞。
           if (cancelled) return
           if (pending.length > 0) {
             const end = nextFrameEnd(pending)
             if (end !== -1) {
               const frame = pending.slice(0, end)
               pending = pending.slice(end)
-              if (!emitFrame(controller, frame)) continue
+              emitFrame(controller, frame)
               return
             }
             // 上游没发空行就关流：剩下的是最后一帧。
             if (sourceEnded) {
               const frame = pending
               pending = new Uint8Array(0)
-              if (!emitFrame(controller, frame)) continue
+              emitFrame(controller, frame)
               return
             }
           } else if (sourceEnded) {
