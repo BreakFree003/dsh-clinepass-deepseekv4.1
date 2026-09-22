@@ -158,6 +158,14 @@ const FETCH_MARK = Symbol.for('dsh-clinepass.fetch-hook')
 
 const DEFAULT_UPSTREAM = 'https://api.cline.bot'
 const DEFAULT_PIN = ['deepseek']
+/**
+ * What to do when the gateway reports that the request was **not** served by the
+ * pinned channel. `strict` (the default) never hands that response to the model:
+ * it is discarded and the call fails. `warn` lets it through after recording the
+ * violation, `off` skips the check (and the buffering it needs).
+ */
+const DEFAULT_ENFORCEMENT = 'strict'
+const ENFORCEMENT_VALUES = ['strict', 'warn', 'off']
 const DEFAULT_CONTEXT_WINDOW = 921600
 const DEFAULT_MAX_TOKENS = 131072
 
@@ -243,10 +251,23 @@ export function withDefaults(raw, logger = console) {
   } catch {
     // Not a URL: `apply` reports it and installs nothing.
   }
+  let enforcement = DEFAULT_ENFORCEMENT
+  if (raw?.enforcement !== undefined) {
+    if (ENFORCEMENT_VALUES.includes(raw.enforcement)) enforcement = raw.enforcement
+    else {
+      logger.warn?.(
+        '[clinepass] unknown enforcement "%s"; using "%s" (expected one of %s)',
+        String(raw.enforcement),
+        DEFAULT_ENFORCEMENT,
+        ENFORCEMENT_VALUES.join(', '),
+      )
+    }
+  }
   return {
     upstream: upstream.replace(/\/+$/, ''),
     pin,
     pins,
+    enforcement,
     provider: text(raw?.provider, PROVIDER),
     model: text(raw?.model, MODEL),
     displayName: text(raw?.displayName, 'Cline Pass'),
@@ -748,6 +769,304 @@ function pinnedBody(text, cfg) {
   return { text: JSON.stringify(applied.body), only, model: body.model ?? null }
 }
 
+// ── 校验：网关到底把这次请求交给了谁 ────────────────────────────────────────
+//
+// `providerOptions.gateway.only` 是 Vercel AI Gateway 文档里的「钉住渠道」写法，
+// 但 api.cline.bot 自 2026-09-22 起**不再执行它**：钉真渠道、钉假渠道、完全不钉，
+// 响应体里的 routing 元数据逐字相同，`fallbacksAvailable` 永远列出全部 16 个渠道。
+// 也就是说「钉选」只是请求里的一段装饰，真正的路由由网关自己决定。
+//
+// 所以钉选必须**在本地兑现**：读完响应，从 routing 里读出真正服务它的渠道，不在允许
+// 列表里就整条丢掉、让这次调用失败 —— 而不是把一个非官方渠道的答案交给模型。
+
+/**
+ * 递归收集某个 JSON 文档里所有 `routing` 对象（网关把它放在
+ * `choices[].delta|message.provider_metadata.gateway.routing`）。
+ *
+ * @param node - 任意 JSON 值。
+ * @param out - 收集结果。
+ * @returns `out`。
+ */
+function collectRouting(node, out = []) {
+  if (node === null || typeof node !== 'object') return out
+  if (Array.isArray(node)) {
+    for (const entry of node) collectRouting(entry, out)
+    return out
+  }
+  if (isPlainObject(node.routing)) out.push(node.routing)
+  for (const value of Object.values(node)) collectRouting(value, out)
+  return out
+}
+
+/**
+ * 从一次响应的原文里取出 routing 元数据。
+ *
+ * 流式响应里 routing 在**最后一帧**（带 `finish_reason` 的那帧）才出现，所以调用方
+ * 必须先缓冲整条响应才能判断 —— 这正是 `strict` 模式要缓冲的原因。
+ *
+ * @param text - 响应体原文（SSE 或单个 JSON 文档）。
+ * @returns 最后一个 routing 对象，没有则 null。
+ */
+export function routingOfText(text) {
+  const found = []
+  for (const line of String(text).split('\n')) {
+    if (!line.startsWith('data:')) continue
+    const data = line.slice(5).trim()
+    if (data === '' || data === '[DONE]') continue
+    try {
+      collectRouting(JSON.parse(data), found)
+    } catch {
+      // 半截帧：SSE 允许，跳过。
+    }
+  }
+  if (found.length === 0) {
+    try {
+      collectRouting(JSON.parse(String(text)), found)
+    } catch {
+      // 不是 JSON：下面按「没有元数据」处理。
+    }
+  }
+  return found.length === 0 ? null : found[found.length - 1]
+}
+
+/**
+ * 判定一次 routing 是否证明「请求由允许的渠道提供」。
+ *
+ * 三个条件缺一不可：有 `finalProvider`、它在允许列表里、**每个成功过的
+ * providerAttempt 都在允许列表里**（中途换过渠道的话，前半段内容来自别家）。
+ *
+ * @param routing - {@link routingOfText} 的返回值。
+ * @param allowed - 允许的渠道 slug 列表。
+ * @returns `{ ok: true, provider }` 或 `{ ok: false, reason }`。
+ */
+export function judgeRouting(routing, allowed) {
+  const allow = new Set(allowed)
+  const list = allowed.join('/')
+  const provider = routing?.finalProvider
+  if (typeof provider !== 'string' || provider.length === 0) {
+    return { ok: false, reason: `响应里没有 finalProvider，无法证明它由 ${list} 提供` }
+  }
+  if (!allow.has(provider)) {
+    return { ok: false, reason: `finalProvider=${provider}，允许的是 ${list}` }
+  }
+  // 网关同时给出 `resolvedProvider`（实测与 finalProvider 同值）。两个字段只要有一个
+  // 指向别家就拒 —— 它们哪天开始不一致，正是该停下来看的时候。
+  const resolved = routing?.resolvedProvider
+  if (typeof resolved === 'string' && resolved.length > 0 && !allow.has(resolved)) {
+    return { ok: false, reason: `resolvedProvider=${resolved}，允许的是 ${list}` }
+  }
+  const attempts = []
+  for (const model of Array.isArray(routing.modelAttempts) ? routing.modelAttempts : []) {
+    for (const attempt of Array.isArray(model?.providerAttempts) ? model.providerAttempts : []) attempts.push(attempt)
+  }
+  // 只看**成功过**的 attempt。网关会不会把「已经吐过字节、然后失败」的那次也算一次
+  // attempt（`success: false`）没法离线验证；真出现这种形状，这条规则要收紧成「出现任何
+  // 非允许渠道的 attempt 就拒」。现在不能那样做：那会把「先试别家失败、再由官方渠道
+  // 服务」这种正常重试一起拒掉。
+  const served = attempts.filter((attempt) => attempt?.success === true)
+  const foreign = served.filter((attempt) => typeof attempt.provider === 'string' && !allow.has(attempt.provider))
+  if (foreign.length > 0) {
+    return { ok: false, reason: `有非允许渠道成功服务过这次请求：${foreign.map((attempt) => attempt.provider).join(', ')}` }
+  }
+  if (served.length === 0) {
+    return { ok: false, reason: `响应里没有任何成功的 providerAttempt，无法证明它由 ${list} 提供` }
+  }
+  return { ok: true, provider, attempts: attempts.length }
+}
+
+/**
+ * 这条响应是不是 SSE（chat 的正常形态）。
+ *
+ * 只看 `content-type`：判断错了不会漏掉校验，只会换一条拒法（SSE 走中断响应体，
+ * 非 SSE 走 400）。
+ *
+ * @param response - 上游响应。
+ * @returns 是否是事件流。
+ */
+function isEventStream(response) {
+  const type = response.headers.get('content-type') ?? ''
+  return type.toLowerCase().includes('text/event-stream')
+}
+
+/**
+ * 把「这一帧里读到的 routing」判成结论。读不到元数据就是**不可证明** —— 与读出一个
+ * 不允许的渠道同等处理（fail closed），否则网关哪天不再发元数据就等于自动放行。
+ *
+ * @param routing - {@link routingOfText} 的最后一个结果，或 null。
+ * @param allowed - 允许的渠道列表。
+ * @returns {@link judgeRouting} 的结论，或「没有元数据」的拒绝。
+ */
+function verdictOf(routing, allowed) {
+  return routing === null
+    ? { ok: false, reason: '响应里没有 gateway.routing 元数据，无法证明它由允许的渠道提供' }
+    : judgeRouting(routing, allowed)
+}
+
+/**
+ * 用已缓冲的原文重建响应。
+ *
+ * `content-encoding` / `content-length` 必须删掉：body 已经被解码成文本，留着
+ * 这两个头会让下游再解一次压缩、或按错误的长度去读。
+ *
+ * @param text - 已解码的响应体。
+ * @param response - 上游响应（取其状态与其余头）。
+ * @returns 重建的响应。
+ */
+function bufferedResponse(text, response) {
+  const headers = new Headers(response.headers)
+  headers.delete('content-encoding')
+  headers.delete('content-length')
+  return new Response(text, { status: response.status, statusText: response.statusText, headers })
+}
+
+/**
+ * 拒绝一条没被允许渠道服务的响应。
+ *
+ * 状态码刻意不用 5xx：dsh 的重试策略默认只重试 `EMPTY_RESPONSE` / `RATE_LIMIT` /
+ * `SERVER` / `TIMEOUT` / `TRANSPORT`，而 5xx 会被 pi-ai 归类成 `SERVER` —— 那就会把
+ * 同一条注定被拒的请求重试 8 次。4xx 归类成 `INVALID_REQUEST`（不在默认集合里），于是
+ * 「拦下即结束」，不浪费往返。文案也刻意避开 rate / timeout / network 这类关键词。
+ *
+ * @param reason - 判定失败的说明。
+ * @param allowed - 允许的渠道列表。
+ * @returns 400 响应。
+ */
+function refusalResponse(reason, allowed) {
+  const message = refusalMessage(reason, false)
+  return new Response(
+    JSON.stringify({ error: { code: 'PROVIDER_PIN_VIOLATION', type: 'provider_pin_violation', message, allowed } }),
+    {
+      status: 400,
+      statusText: 'Provider Pin Violation',
+      headers: { 'content-type': 'application/json', 'x-dsh-clinepass-refused': 'provider-pin' },
+    },
+  )
+}
+
+/**
+ * 违规文案。
+ *
+ * 流式与缓冲两种拒法的后果不同，文案必须说清：缓冲（非流式响应）时内容从未离开网关；
+ * 流式时内容已经边流边显示过，只是在**装配之前**把这次调用作废了 —— 模型上下文里没有
+ * 它、工具也不会执行。含糊其辞会让用户以为「看见了就等于模型用过」。
+ *
+ * 同样刻意避开 rate / timeout / network / 5xx 这类关键词：dsh 用正则给 pi-ai 的失败
+ * 分类，命中就会被默认重试策略当成可重试错误。
+ *
+ * @param reason - 判定失败的说明。
+ * @param streamed - 是否是「已经流出去过」的那条路径。
+ * @returns 展示给用户的文案。
+ */
+function refusalMessage(reason, streamed) {
+  const tail = streamed
+    ? '这次调用已作废：内容没有进入模型上下文、工具也不会执行（可能已在窗口里闪现）。enforcement=strict；想只告警就设 enforcement: "warn"。'
+    : '已丢弃这条响应、没有交给模型（enforcement=strict；想只告警就设 enforcement: "warn"）。'
+  const message = `cline-pass 渠道校验未通过：${reason}。${tail}`
+  if (!isRetryableFailureText(message)) return message
+  // 动态部分（渠道名来自网关）撞上了可重试关键词：换成不含它的文案。宁可少一句诊断，
+  // 也别让一条注定被拒的请求按 maxRetries 重打 —— 诊断原文在日志与 lastViolation 里。
+  return `cline-pass 渠道校验未通过：响应不是由允许的渠道提供。${tail}（具体渠道见状态文件的 lastViolation 与日志）`
+}
+
+/**
+ * dsh 判断失败能不能重试，靠的是在错误文案上跑一遍正则（`classifyPiAiError`）。命中
+ * `RATE_LIMIT` / `SERVER` / `TIMEOUT` / `TRANSPORT` 这几类，就会按 `maxRetries` 重打 ——
+ * 对一条注定被拒的请求，那是白花 8 次调用。
+ *
+ * 静态文案是自己写的、可控；**渠道名来自网关**，理论上可能带着 `rate`、`timeout`、`500`
+ * 这类字样。所以拼好的文案再过一遍同样的判定，命中就退回不含动态部分的版本。
+ *
+ * 这些模式是 `dsh-llm-pi-ai` 里 `classifyPiAiError` 的镜像：它哪天加了新词，这里最坏只是
+ * 漏网（退回今天的行为），不会把本来安全的文案变成危险的。
+ */
+const RETRYABLE_FAILURE_TEXT =
+  /\b(?:401|403|413|400|429)\b|\b5\d\d\b|rate.?limit|quota|invalid.?request|payload too large|request body too large|time(?:d)?\s*out|timeout|stream ended (?:before|without)|network|connection|socket|fetch|ECONN[A-Z]+|other side closed|premature close|terminated|websocket closed unexpectedly|http2 request did not get a response/i
+
+/**
+ * 这段文案会不会被 dsh 当成「可重试的失败」。
+ *
+ * 导出只为测试；真实用途是给 `refusalMessage` 当护栏。
+ *
+ * @param text - 待判定的错误文案。
+ * @returns 会被分类成可重试失败时为 true。
+ */
+export function isRetryableFailureText(text) {
+  return RETRYABLE_FAILURE_TEXT.test(String(text))
+}
+
+/**
+ * 流式路径的拒法：把响应体**中断**掉。
+ *
+ * 不能像缓冲路径那样返回 400 —— HTTP 状态在第一帧内容出去时就定死了。改为让响应体
+ * 报错：pi-ai 的 openai 适配器把读流异常转成 `error` 事件，agent loop 据此只落一条
+ * `assistant/attempt`（无 surface op，不进上下文）并结束这一步，绝不装配 `assistant/message`
+ * —— 于是工具不会执行。注意**终止帧必须扣住**：只要 `data: [DONE]` 先到了消费者手里，
+ * 适配器就会当成正常收尾去装配消息，那时候再报错已经晚了。
+ *
+ * @param reason - 判定失败的说明。
+ * @param allowed - 允许的渠道列表。
+ * @returns 抛进响应流的错误。
+ */
+function refusalError(reason, allowed) {
+  const error = new Error(refusalMessage(reason, true))
+  error.name = 'ClinePassPinViolation'
+  error.code = 'PROVIDER_PIN_VIOLATION'
+  error.allowed = [...allowed]
+  return error
+}
+
+/** SSE 帧以空行结束。分隔符按**字节**找：正文原样转发才有保真与节奏。 */
+const SSE_NEWLINE = 0x0a
+const SSE_CARRIAGE_RETURN = 0x0d
+
+/**
+ * 找到 `pending` 里第一个完整 SSE 帧的结束位置（含那个空行）。
+ *
+ * 空行有 LF LF 与 CR LF CR LF 两种写法（SSE 规范都允许），所以要看一个 `\n` 后面
+ * 跟的是 `\n` 还是 `\r\n`。UTF-8 的多字节序列里不可能出现 0x0A / 0x0D，所以按字节
+ * 切帧不会把一个字符劈成两半。
+ *
+ * @param pending - 尚未消费的字节。
+ * @returns 帧结束的下标（不含），没有完整帧时返回 -1。
+ */
+export function nextFrameEnd(pending) {
+  for (let index = 0; index < pending.length; index += 1) {
+    if (pending[index] === SSE_NEWLINE) {
+      if (pending[index + 1] === SSE_NEWLINE) return index + 2
+      if (pending[index + 1] === SSE_CARRIAGE_RETURN && pending[index + 2] === SSE_NEWLINE) return index + 3
+      continue
+    }
+    // 单独的 `\r` 在 SSE 规范里也是换行，openai 的 findDoubleNewlineIndex 认 `\r\r`。
+    // 切帧的规则要和**消费者**一致：认不出它的边界，整条响应就会攒成一大块。
+    if (pending[index] === SSE_CARRIAGE_RETURN && pending[index + 1] === SSE_CARRIAGE_RETURN) return index + 2
+  }
+  return -1
+}
+
+/**
+ * 这一帧是不是 SSE 的终止帧（`data: [DONE]`）。
+ *
+ * 解码只用于判断，转发的是原始字节；整帧都是 ASCII，不存在半个字符的问题。
+ *
+ * @param frame - 一帧原始字节。
+ * @returns 是否是终止帧。
+ */
+export function isTerminatorFrame(frame) {
+  // `data:` 后**最多一个空格** —— 这正是 openai 解码器的判定（它剥掉 `data:` 和一个可选
+  // 空格后看 `startsWith('[DONE]')`）。宽一格就会把它眼里的「坏帧」当成终止帧扣下来，
+  // 通过裁决后又原样放回去，消费者那边照样先报 JSON 解析错。
+  return /(?:^|\n)data: ?\[DONE\]/.test(new TextDecoder().decode(frame))
+}
+
+/** 拼接字节块。帧很小（一条 delta），朴素的重新分配足够，不值得为它引入分片列表。 */
+function concatBytes(left, right) {
+  if (left.length === 0) return right
+  const joined = new Uint8Array(left.length + right.length)
+  joined.set(left, 0)
+  joined.set(right, left.length)
+  return joined
+}
+
 /**
  * Build the in-process pin hook without a plugin context (used by apply() and tests).
  *
@@ -768,7 +1087,11 @@ export function createFetchPin(config, logger = console) {
   let calling = false
   let hookState = 'absent'
   let lastPin = null
-  const counters = { seen: 0, pinned: 0, skipped: 0 }
+  const counters = { seen: 0, pinned: 0, skipped: 0, blocked: 0, unverified: 0 }
+  /** 最近一次校验通过 / 被拦下的记录（status 文件里能直接看到「网关把它交给了谁」）。 */
+  let lastVerified = null
+  let lastViolation = null
+  let lastUnverified = null
 
   /** The base URL the provider profile must point at: the gateway itself. */
   const profileBaseURL = () => `${cfg.upstream}${PROFILE_PATH}`
@@ -782,9 +1105,16 @@ export function createFetchPin(config, logger = console) {
    * requests are rare, and a synchronous write of a few hundred bytes is
    * cheaper than making this state unreachable), and never allowed to break a
    * request.
+   *
+   * A disposed instance stays reachable as the `original` of the hook that
+   * replaced it (that is how a wrapper chain survives a reload), so **the
+   * record belongs to the instance that owns the global fetch**: without this
+   * guard the old one would keep rewriting the file with `hook: "uninstalled"`
+   * and stale counters every time a request passed through its layer.
    */
   function publish() {
     if (statusPath === null) return
+    if (installed && !owns() && ours()) return
     try {
       fs.mkdirSync(path.dirname(statusPath), { recursive: true })
       const payload = `${JSON.stringify(
@@ -797,6 +1127,10 @@ export function createFetchPin(config, logger = console) {
           profileBaseURL: profileBaseURL(),
           counters: { ...counters },
           lastPin,
+          enforcement: cfg.enforcement,
+          lastVerified,
+          lastViolation,
+          lastUnverified,
           // Config keys that were read and ignored, so an upgrade from the
           // port era is visible even where plugin warnings are not.
           ignoredOptions: cfg.ignoredOptions ?? [],
@@ -886,6 +1220,263 @@ export function createFetchPin(config, logger = console) {
     }
   }
 
+  /**
+   * 记一次「网关没把请求交给允许的渠道」。
+   *
+   * @param reason - 判定失败的说明。
+   * @param allowed - 允许的渠道列表。
+   * @param routing - 读出（或读不出）的 routing。
+   * @returns 给调用方的响应（strict 拒绝，warn 放行由调用方决定）。
+   */
+  function recordViolation(reason, allowed, routing) {
+    counters.blocked += 1
+    lastViolation = {
+      at: new Date().toISOString(),
+      allowed: [...allowed],
+      reason,
+      finalProvider: typeof routing?.finalProvider === 'string' ? routing.finalProvider : null,
+      fallbacksAvailable: Array.isArray(routing?.fallbacksAvailable) ? routing.fallbacksAvailable.slice(0, 20) : null,
+    }
+    publish()
+    logger.error?.('[clinepass] ✗ 拦下一条不是 %s 提供的响应：%s', allowed.join('/'), reason)
+  }
+
+  /**
+   * 记一次「没能校验」：流没有正常收尾（用户按停止、socket 断），裁决从未发生。
+   *
+   * 既不是违规（没有证据说它来自别家），也**不能算通过** —— 单列一格，免得被读成
+   * 「一切正常」。中止那种情况里已经显示出去的内容可能已进上下文，见 README。
+   *
+   * @param url - 请求 URL。
+   * @param reason - `aborted`（用户/父级取消）或 `stream failed`（其它读流失败）。
+   * @param error - 引发它的错误。
+   */
+  function recordUnverified(url, reason, error) {
+    counters.unverified += 1
+    lastUnverified = {
+      at: new Date().toISOString(),
+      url,
+      reason,
+      detail: error instanceof Error ? error.message : String(error),
+    }
+    publish()
+    logger.warn?.('[clinepass] ⚠ 一条流没有正常收尾（%s），渠道没能校验：%s', reason, lastUnverified.detail)
+  }
+
+  /**
+   * 校验一次「钉选」请求的响应确实由允许的渠道提供，并把结论落到状态文件。
+   *
+   * 两条路径按响应类型分派：
+   *
+   * - **SSE（chat 的正常形态）**：见 {@link streamedVerification}。内容逐帧立即转发
+   *   （保住逐字显示与分片时间戳，TPS 才有意义），只把终止帧扣到裁决之后；违规时
+   *   中断响应体，让这次调用作废。
+   * - **非 SSE（一次性 JSON）**：本来就没有流式可言，读完整条再判，违规返回 400。
+   *
+   * 非 2xx 一律原样放行：那是一次失败的调用（429/5xx/…），没有内容会被「使用」，
+   * 而把网关的错误改写成自己的错误会掩盖配额、限流这些 dsh 需要看到的东西。
+   *
+   * @param response - 上游响应。
+   * @param allowed - 这次请求的允许渠道列表。
+   * @param url - 请求 URL（记录用）。
+   * @param signal - 调用方的取消信号（用户中止这一轮时不该被记成一次「渠道违规」）。
+   * @returns 放行的响应，或被拒/被中断的响应。
+   */
+  async function verifyPinned(response, allowed, url, signal) {
+    if (!response.ok) return response
+    if (isEventStream(response) && response.body !== null) return streamedVerification(response, allowed, url, signal)
+    let text
+    try {
+      text = await response.text()
+    } catch (error) {
+      // 用户自己按了停止：这是取消，不是渠道违规 —— 原样抛回去，让 dsh 走它自己的
+      // 「已中止」路径（否则会显示成一条莫名其妙的 400，还污染 blocked 计数）。
+      if (signal?.aborted === true || (error instanceof Error && error.name === 'AbortError')) throw error
+      const reason = `响应体读取失败（${error instanceof Error ? error.message : String(error)}），无法确认它由允许的渠道提供`
+      recordViolation(reason, allowed, null)
+      return refusalResponse(reason, allowed)
+    }
+    let routing = null
+    try {
+      routing = routingOfText(text)
+    } catch {
+      routing = null
+    }
+    const verdict = verdictOf(routing, allowed)
+    if (verdict.ok) {
+      recordVerified(url, verdict, allowed)
+      return bufferedResponse(text, response)
+    }
+    recordViolation(verdict.reason, allowed, routing)
+    if (cfg.enforcement === 'warn') return bufferedResponse(text, response)
+    return refusalResponse(verdict.reason, allowed)
+  }
+
+  /**
+   * 边流边校验：内容立刻交给消费者，**只扣住 SSE 终止帧**。
+   *
+   * 为什么这是唯一能同时保住「钉选」和「TPS/逐字流式」的形状：网关的
+   * `providerOptions.gateway.only` 自 2026-09-22 起已不再被执行（钉真渠道、钉假渠道、
+   * 完全不钉，响应体逐字相同），真正服务这次请求的渠道只能从响应体**最后一帧**的
+   * `gateway.routing` 读出来 —— 这是信息论上的下界，早不了。
+   *
+   * 所以「不把非官方渠道的答案交给模型」只能靠**撤回**兑现：内容照常流出去，但终止帧
+   * 扣在手里；等 routing 到了再裁决，通过才放行终止帧，违规就把响应体报错。dsh 侧
+   * （pi-ai `error` 事件 → agent loop）只落一条 `assistant/attempt`（无 surface op，
+   * 不进上下文），**绝不装配 `assistant/message`，于是工具不会执行**。
+   *
+   * 代价要说清：违规时内容已经显示过（然后这一步失败），不像缓冲路径那样从未离开网关。
+   * `warn` 不扣终止帧、不拒，只记录 —— 于是它也重获流式。
+   *
+   * 收尾必须是 `controller.error()`，不能改成 TransformStream 里 `flush` 时 `throw`：那样
+   * 抛出的异常走流内部的收尾算法，消费者没同时在读时就成了**未捕获异常**，会把宿主进程
+   * 带走。手动 ReadableStream 的 `pull` 天然按背压取数，错误也只落在流的读取端。
+   *
+   * 取消（用户按停止）不是违规：上游 body 会先报错，裁决根本不会发生，所以不会污染
+   * `blocked` 计数。
+   *
+   * @param response - 上游 2xx SSE 响应。
+   * @param allowed - 允许的渠道列表。
+   * @param url - 请求 URL（记录用）。
+   * @returns 逐帧放行、按裁决收尾的响应。
+   */
+  function streamedVerification(response, allowed, url, signal) {
+    const holdTerminator = cfg.enforcement === 'strict'
+    const decoder = new TextDecoder()
+    let reader = null
+    let pending = new Uint8Array(0)
+    let held = null
+    let routing = null
+    let sourceEnded = false
+    let concluded = false
+    let cancelled = false
+
+    /** 按背压向上游要字节；第一次真正要数据时才把 body 锁成 reader。 */
+    const source = () => (reader ??= response.body.getReader())
+    /** 记下一帧里读到的 routing（只留最后一个，内存不随响应增长）。 */
+    const note = (frame) => {
+      const found = routingOfText(decoder.decode(frame))
+      if (found !== null) routing = found
+    }
+    /** 扣住终止帧。正常情况下只有一帧；真出现第二帧就一并扣住，宁可最后一起放行。 */
+    const hold = (frame) => {
+      held = held === null ? frame : concatBytes(held, frame)
+    }
+    /**
+     * 处理一帧：先读它的 routing，再决定转发还是扣住。
+     *
+     * `note()` **必须在扣帧之前**：扣住的是「留着待放」的字节，不是丢弃的字节 —— 网关若
+     * 把 routing 和 [DONE] 写进同一帧（多行 `data:` 是合法 SSE），漏扫就等于拿上一帧的旧
+     * 结论替它背书，闸会放行一条别家提供的响应。
+     *
+     * @param controller - 下游流的控制器。
+     * @param frame - 一帧原始字节。
+     * @returns 已放行（true）还是扣住（false）。
+     */
+    const emitFrame = (controller, frame) => {
+      note(frame)
+      if (holdTerminator && isTerminatorFrame(frame)) {
+        hold(frame)
+        return false
+      }
+      controller.enqueue(frame)
+      return true
+    }
+    /** 源已结束：裁决，然后放行终止帧收尾，或按违规中断。 */
+    const conclude = (controller) => {
+      // 下游已经取消（用户按停止）就没有「收尾」可言：这时候 routing 往往还没到，
+      // 硬判会得到一条**假的违规**。取消由 cancel() 记成 unverified。
+      if (concluded || cancelled) return
+      concluded = true
+      const verdict = verdictOf(routing, allowed)
+      if (verdict.ok) {
+        recordVerified(url, verdict, allowed)
+        if (held !== null) controller.enqueue(held)
+        controller.close()
+        return
+      }
+      recordViolation(verdict.reason, allowed, routing)
+      if (!holdTerminator) {
+        if (held !== null) controller.enqueue(held)
+        controller.close()
+        return
+      }
+      // 扣住的终止帧就此丢掉：消费者看到的是流中断，而不是一次正常收尾。
+      controller.error(refusalError(verdict.reason, allowed))
+    }
+
+    const body = new ReadableStream({
+      async pull(controller) {
+        for (;;) {
+          if (cancelled) return
+          if (pending.length > 0) {
+            const end = nextFrameEnd(pending)
+            if (end !== -1) {
+              const frame = pending.slice(0, end)
+              pending = pending.slice(end)
+              if (!emitFrame(controller, frame)) continue
+              return
+            }
+            // 上游没发空行就关流：剩下的是最后一帧。
+            if (sourceEnded) {
+              const frame = pending
+              pending = new Uint8Array(0)
+              if (!emitFrame(controller, frame)) continue
+              return
+            }
+          } else if (sourceEnded) {
+            conclude(controller)
+            return
+          }
+          let chunk
+          try {
+            chunk = await source().read()
+          } catch (error) {
+            // 读流失败（用户按停止、socket 断）时**裁决根本不会发生**：渠道没能校验，
+            // 而这次已经显示出去的部分内容可能被 dsh 当成「被打断的回复」记进上下文
+            // （见 README「中止的流不受保护」）。记一笔，别让它悄悄发生。
+            if (!concluded) {
+              concluded = true
+              const aborted = signal?.aborted === true || (error instanceof Error && error.name === 'AbortError')
+              recordUnverified(url, aborted ? 'aborted' : 'stream failed', error)
+            }
+            throw error
+          }
+          if (chunk.done) {
+            sourceEnded = true
+            continue
+          }
+          pending = concatBytes(pending, chunk.value)
+        }
+      },
+      cancel(reason) {
+        cancelled = true
+        // 消费者不要这条流了（dsh 中止、或自己 break）：渠道没校验成，记 unverified ——
+        // 但**不是违规**。这也是「中止的流不受保护」那条限制在状态文件里的痕迹。
+        if (!concluded) {
+          concluded = true
+          recordUnverified(url, signal?.aborted === true ? 'aborted' : 'cancelled', reason)
+        }
+        // reader 还没建就直接取消源；建了就只能经 reader 取消（body 已被锁住）。
+        const target = reader ?? response.body
+        target.cancel(reason).catch(() => {})
+      },
+    })
+    const headers = new Headers(response.headers)
+    // 正文已经过 fetch 解码；重建后不能再让下游按这两个头处理一遍。
+    headers.delete('content-encoding')
+    headers.delete('content-length')
+    return new Response(body, { status: response.status, statusText: response.statusText, headers })
+  }
+  /** 记一次校验通过，并立刻落盘（状态文件里的 lastVerified 不该慢一拍）。 */
+  function recordVerified(url, verdict, allowed) {
+    lastVerified = { at: new Date().toISOString(), url, provider: verdict.provider, allowed: [...allowed], attempts: verdict.attempts }
+    logger.info?.('[clinepass] ✓ %s 由 %s 提供（允许 %s），已放行', url, verdict.provider, allowed.join(', '))
+    // 校验发生在响应到达之后，而请求发起时的那次 publish() 早于它 —— 不补这一次，
+    // 状态文件里的 lastVerified 会永远慢一拍。
+    publish()
+  }
+
   const wrapper = function pinnedFetch(input, init) {
     // Only reachable through `globalThis.fetch`, which is only replaced once
     // `original` is set; the guard keeps a hand-driven call readable.
@@ -913,7 +1504,13 @@ export function createFetchPin(config, logger = console) {
         lastPin = { at: new Date().toISOString(), url, model: next.next.model, only: next.next.only }
         publish()
         report(url, next.next)
-        return next.kind === 'request' ? passThrough(next.request) : passThrough(input, next.init)
+        const sent = next.kind === 'request' ? passThrough(next.request) : passThrough(input, next.init)
+        // 校验只对「带着 pin 的 chat 请求」有意义：pin 为空表示用户没要求钉选。
+        if (cfg.enforcement === 'off' || next.next.only.length === 0) return sent
+        const signal = next.kind === 'request' ? next.request.signal : (next.init.signal ?? input?.signal)
+        // `Promise.resolve` 而不是直接 `.then`：真的 fetch 一定返回 promise，但测试替身
+        // 可能直接返回一个 Response，而 wrapper 不该因此炸掉。
+        return Promise.resolve(sent).then((response) => verifyPinned(response, next.next.only, url, signal))
       },
       (error) => {
         counters.skipped += 1
@@ -984,6 +1581,19 @@ export function createFetchPin(config, logger = console) {
     config: cfg,
     counters,
     profileBaseURL,
+    /**
+     * 当前校验状态的一份快照（冒烟测试与排查用；status 文件写的是同一批字段）。
+     *
+     * @returns `{ counters, enforcement, lastPin, lastVerified, lastViolation }`。
+     */
+    state: () => ({
+      counters: { ...counters },
+      enforcement: cfg.enforcement,
+      lastPin,
+      lastVerified,
+      lastViolation,
+      lastUnverified,
+    }),
     /** Re-check whether the hook still owns `globalThis.fetch` (also runs on a timer). */
     checkOwnership,
     /**

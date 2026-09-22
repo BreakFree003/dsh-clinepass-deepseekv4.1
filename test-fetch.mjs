@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import { createFetchPin, installPromptDisplay, isGatewayChat, provisionProfile, statusFileFor, withDefaults } from './index.js'
+import { createFetchPin, installPromptDisplay, isGatewayChat, isRetryableFailureText, isTerminatorFrame, nextFrameEnd, provisionProfile, statusFileFor, withDefaults } from './index.js'
 
 // The hook publishes a status file by default; keep every run's out of the
 // user's real DSH_HOME (and let the default resolution be what is exercised).
@@ -74,6 +74,41 @@ const jsonInit = (extra = {}) => ({
   body: JSON.stringify(CHAT_BODY),
   ...extra,
 })
+
+/**
+ * 一份「由 provider 服务」的网关响应。
+ *
+ * 本地闸（`enforcement: strict`，默认）拿到响应后会读 `gateway.routing` 判断真正服务
+ * 这次请求的是谁，读不出允许的渠道就整条拒掉。所以假网关的响应必须带上这段元数据 ——
+ * 不带的话这些「钉选/透传」用例全会撞在闸上（那本身是对的，见第 4b 节）。
+ *
+ * @param provider - `finalProvider` 的值。
+ * @param resolved - `resolvedProvider` 的值（默认与 `finalProvider` 相同）。
+ * @returns 响应体 JSON 文本。
+ */
+function gatewayBody(provider = 'deepseek', resolved = provider) {
+  return JSON.stringify({
+    ok: true,
+    choices: [
+      {
+        message: {
+          provider_metadata: {
+            gateway: {
+              routing: {
+                finalProvider: provider,
+                resolvedProvider: resolved,
+                fallbacksAvailable: [],
+                modelAttempts: [{ providerAttempts: [{ provider, success: true }] }],
+              },
+            },
+          },
+        },
+      },
+    ],
+  })
+}
+
+const GATEWAY_BODY = gatewayBody('deepseek')
 
 /** Replace globalThis.fetch with a recording stub; returns the stub and a restore. */
 function stubFetch(handler) {
@@ -175,7 +210,7 @@ console.log('\n── 3. everything else goes out untouched ──────�
 // ── 4. the pin itself ───────────────────────────────────────────────────────
 console.log('\n── 4. the pin ────────────────────────────────────────────')
 {
-  const expected = new Response('sentinel')
+  const expected = new Response(GATEWAY_BODY)
   const stub = stubFetch(() => expected)
   const logger = recorder()
   const hook = createFetchPin({}, logger)
@@ -185,7 +220,8 @@ console.log('\n── 4. the pin ───────────────�
   const response = await globalThis.fetch(CHAT, init)
   const sent = stub.calls[0]
   check('the gateway call was seen', hook.counters.seen === 1, JSON.stringify(hook.counters))
-  check('the response is the real one', response === expected)
+  // 闸会读完整条响应再重建一个（body 换成缓冲后的那份），所以这里比内容、不比对象身份。
+  check('the verified response is passed through', (await response.text()) === GATEWAY_BODY, `HTTP ${response.status}`)
   check('the body carries the pin', JSON.stringify(only(sent)) === '["deepseek"]', JSON.stringify(only(sent)))
   check('the model is preserved', bodyOf(sent).model === CHAT_BODY.model)
   check('the messages are preserved', JSON.stringify(bodyOf(sent).messages) === JSON.stringify(CHAT_BODY.messages))
@@ -236,10 +272,79 @@ console.log('\n── 4. the pin ───────────────�
   stub.restore()
 }
 
+// ── 4b. the local gate ──────────────────────────────────────────────────────
+//
+// 网关自 2026-09-22 起不再执行 providerOptions.gateway.only，钉选改由插件在本地兑现：
+// 读完整条响应、从 routing 里读出真正服务它的渠道，不在允许列表里就整条丢掉。
+console.log('\n── 4b. the local gate ────────────────────────────────────')
+{
+  // 允许 deepseek，网关却说是 alibaba → 必须拒，而且响应体里不能有任何模型输出。
+  const stub = stubFetch(() => new Response(gatewayBody('alibaba')))
+  const logger = recorder()
+  const hook = createFetchPin({}, logger)
+  hook.install()
+  const response = await globalThis.fetch(CHAT, jsonInit())
+  const body = await response.text()
+  check('a foreign channel is refused with 400', response.status === 400, `HTTP ${response.status}`)
+  check('the refusal is machine-readable', /PROVIDER_PIN_VIOLATION/.test(body), body.slice(0, 100))
+  check('the model output is not handed over', !/"ok":true/.test(body), body.slice(0, 100))
+  check('the refusal is counted', hook.counters.blocked === 1, JSON.stringify(hook.counters))
+  check('the violation names the provider', hook.state().lastViolation?.finalProvider === 'alibaba', JSON.stringify(hook.state().lastViolation ?? null).slice(0, 120))
+  check('the violation is logged as an error', logger.lines.error.some((line) => line.includes('拦下')), JSON.stringify(logger.lines.error))
+  hook.uninstall()
+
+  // warn：同样判定，但放行，只记录。
+  const warnStub = stubFetch(() => new Response(gatewayBody('alibaba')))
+  const warnHook = createFetchPin({ enforcement: 'warn' }, recorder())
+  warnHook.install()
+  const warned = await globalThis.fetch(CHAT, jsonInit())
+  check('warn lets a foreign response through', warned.status === 200 && (await warned.text()) === gatewayBody('alibaba'), `HTTP ${warned.status}`)
+  check('warn still counts and records it', warnHook.counters.blocked === 1 && warnHook.state().lastViolation?.finalProvider === 'alibaba')
+  warnHook.uninstall()
+
+  // off：不校验、不缓冲 —— 响应对象原样返回。
+  const offExpected = new Response(gatewayBody('alibaba'))
+  const offStub = stubFetch(() => offExpected)
+  const offHook = createFetchPin({ enforcement: 'off' }, recorder())
+  offHook.install()
+  check('off returns the very same response', (await globalThis.fetch(CHAT, jsonInit())) === offExpected)
+  check('off blocks nothing', offHook.counters.blocked === 0 && offHook.state().lastViolation === null, JSON.stringify(offHook.counters))
+  offHook.uninstall()
+
+  // 没有 routing 元数据 = 无法证明 → strict 下按未通过处理（fail closed）。
+  const muteStub = stubFetch(() => new Response('{"ok":true}'))
+  const muteHook = createFetchPin({}, recorder())
+  muteHook.install()
+  const mute = await globalThis.fetch(CHAT, jsonInit())
+  check('a response with no routing metadata is refused', mute.status === 400 && /没有 gateway\.routing 元数据/.test(await mute.text()), `HTTP ${mute.status}`)
+  muteHook.uninstall()
+
+  // 非 2xx 原样放行：那是失败的调用，改写它会掩盖配额/限流。
+  const errStub = stubFetch(() => new Response('{"error":"rate limited"}', { status: 429 }))
+  const errHook = createFetchPin({}, recorder())
+  errHook.install()
+  const err = await globalThis.fetch(CHAT, jsonInit())
+  check('an upstream error passes through untouched', err.status === 429 && errHook.counters.blocked === 0, `HTTP ${err.status}`)
+  errHook.uninstall()
+
+  // 两个「谁服务了它」的字段必须都指向允许的渠道：网关哪天开始让它们不一致，
+  // 就该停下来看，而不是挑好看的那个信。
+  const splitStub = stubFetch(() => new Response(gatewayBody('deepseek', 'alibaba')))
+  const splitHook = createFetchPin({}, recorder())
+  splitHook.install()
+  const split = await globalThis.fetch(CHAT, jsonInit())
+  check('a disagreeing resolvedProvider is refused', split.status === 400 && /resolvedProvider=alibaba/.test(await split.text()), `HTTP ${split.status}`)
+  splitHook.uninstall()
+
+  // 恢复顺序必须**逆序**：每个 stub 记下的 `real` 是它创建时的那个 fetch，
+  // 顺序恢复会把 globalThis.fetch 留在中间某个已经作废的 stub 上。
+  splitStub.restore(); errStub.restore(); muteStub.restore(); offStub.restore(); warnStub.restore(); stub.restore()
+}
+
 // ── 5. per-model pins and an empty pin ──────────────────────────────────────
 console.log('\n── 5. per-model pins, empty pin ──────────────────────────')
 {
-  const stub = stubFetch(() => new Response('{}'))
+  const stub = stubFetch(() => new Response(GATEWAY_BODY))
   const hook = createFetchPin({ pin: ['deepseek'], pins: { 'cline-pass/other': ['anthropic'] } }, recorder())
   hook.install()
 
@@ -674,7 +779,8 @@ console.log('\n── 11. integration through the real fetch ──────�
     const text = Buffer.concat(chunks).toString('utf8')
     received.push({ label, url: req.url, headers: req.headers, text, body: text.length === 0 ? null : JSON.parse(text) })
     res.writeHead(200, { 'content-type': 'application/json' })
-    res.end('{"ok":true}')
+    // 带 routing 元数据：本地闸要读它才放行（见 gatewayBody）。
+    res.end(GATEWAY_BODY)
   }
   const gateway = http.createServer(record('gateway'))
   const elsewhere = http.createServer(record('elsewhere'))
@@ -766,6 +872,355 @@ console.log('\n── 12. the prompt display ───────────�
     textOf(renamedLive, 'deployment:persona-prefix') === 'You are a coding agent powered by the deepseek-v4.1-flash model.',
     textOf(renamedLive, 'deployment:persona-prefix'),
   )
+}
+
+// ── 13. the streaming gate ──────────────────────────────────────────────────
+//
+// routing 元数据只在最后一帧出现，所以「校验」与「边流边显示」只能靠**扣住终止帧**
+// 共存：内容立即转发，裁决通过才放行 [DONE]；违规就中断响应体 —— 消费者的流异常会让
+// dsh 只落一条 assistant/attempt，绝不装配 assistant/message（于是工具不执行）。
+console.log('\n── 13. the streaming gate ────────────────────────────────')
+{
+  const enc = (text) => new TextEncoder().encode(text)
+  const delta = (index) => `data: ${JSON.stringify({ choices: [{ delta: { content: `tok${index}` } }] })}\n\n`
+  const routingFrame = (provider, resolved = provider) => `data: ${gatewayBody(provider, resolved)}\n\n`
+  const sse = (body) => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  const frames = (...parts) => sse(new ReadableStream({
+    start(controller) {
+      for (const part of parts) controller.enqueue(enc(part))
+      controller.close()
+    },
+  }))
+
+  /** 逐块读完一个响应体；出错时把错误一起带回来（流式中断是正常结局之一）。 */
+  async function drain(response) {
+    const parts = []
+    const reader = response.body.getReader()
+    for (;;) {
+      try {
+        const { done, value } = await reader.read()
+        if (done) return { text: parts.join(''), error: null }
+        parts.push(new TextDecoder().decode(value))
+      } catch (error) {
+        return { text: parts.join(''), error }
+      }
+    }
+  }
+
+  // 内容必须**在裁决之前**到达消费者：上游只发了一帧 delta 就停住，此刻就该能读到它。
+  // 缓冲路径下这次 read() 会一直等下去（这正是 TPS 被搞坏的那条路）。
+  {
+    let release
+    const gate = new Promise((resolve) => { release = resolve })
+    const stub = stubFetch(() => sse(new ReadableStream({
+      async start(controller) {
+        controller.enqueue(enc(delta(0)))
+        await gate
+        controller.enqueue(enc(routingFrame('deepseek')))
+        controller.enqueue(enc('data: [DONE]\n\n'))
+        controller.close()
+      },
+    })))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const reader = (await globalThis.fetch(CHAT, jsonInit())).body.getReader()
+    const first = new TextDecoder().decode((await reader.read()).value)
+    check('strict streams content before the verdict', first.includes('tok0'), JSON.stringify(first))
+    release()
+    const tail = []
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      tail.push(new TextDecoder().decode(value))
+    }
+    check('the held terminator is released once the verdict passes', tail.join('').includes('[DONE]'), JSON.stringify(tail.join('')))
+    check('a verified stream is recorded', hook.state().lastVerified?.provider === 'deepseek', JSON.stringify(hook.state().lastVerified ?? null))
+    check('a verified stream blocks nothing', hook.counters.blocked === 0, JSON.stringify(hook.counters))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 违规：内容照常流出去（这是拿回 TPS 的代价），但终止帧永远不到，响应体在裁决处报错。
+  {
+    const stub = stubFetch(() => frames(delta(0), routingFrame('alibaba'), 'data: [DONE]\n\n'))
+    const logger = recorder()
+    const hook = createFetchPin({}, logger)
+    hook.install()
+    const { text, error } = await drain(await globalThis.fetch(CHAT, jsonInit()))
+    check('a foreign streamed channel still delivers the content frames', text.includes('tok0'), JSON.stringify(text))
+    check('…but never the terminator', !text.includes('[DONE]'), JSON.stringify(text))
+    check('…and the body fails instead of completing', error !== null && /渠道校验未通过/.test(error.message), String(error?.message))
+    check('the streamed refusal names no retryable keyword', error !== null && !/rate|timeout|network|fetch|5\d\d/.test(error.message), String(error?.message))
+    check('the streamed violation is counted', hook.counters.blocked === 1, JSON.stringify(hook.counters))
+    check('the streamed violation names the provider', hook.state().lastViolation?.finalProvider === 'alibaba', JSON.stringify(hook.state().lastViolation ?? null).slice(0, 120))
+    check('the streamed violation is logged as an error', logger.lines.error.some((line) => line.includes('拦下')), JSON.stringify(logger.lines.error))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 没有 routing 元数据 = 不可证明 → 同样 fail closed，终止帧也不放行。
+  {
+    const stub = stubFetch(() => frames(delta(0), 'data: [DONE]\n\n'))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const { text, error } = await drain(await globalThis.fetch(CHAT, jsonInit()))
+    check('a streamed response with no routing metadata is refused', error !== null && /没有 gateway\.routing 元数据/.test(error.message), String(error?.message))
+    check('…and its terminator is withheld too', !text.includes('[DONE]'), JSON.stringify(text))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // warn 不扣终止帧、不中断，只记录 —— 于是 warn 也重获流式（旧实现里它同样缓冲）。
+  {
+    const stub = stubFetch(() => frames(delta(0), routingFrame('alibaba'), 'data: [DONE]\n\n'))
+    const hook = createFetchPin({ enforcement: 'warn' }, recorder())
+    hook.install()
+    const { text, error } = await drain(await globalThis.fetch(CHAT, jsonInit()))
+    check('warn streams a foreign response to the end', error === null && text.includes('tok0') && text.includes('[DONE]'), JSON.stringify(text))
+    check('warn still counts and records it', hook.counters.blocked === 1 && hook.state().lastViolation?.finalProvider === 'alibaba')
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 上游中途坏掉（用户按停止、socket 断）不是渠道违规：错误原样传下去，不计数。
+  {
+    const stub = stubFetch(() => sse(new ReadableStream({
+      start(controller) {
+        controller.enqueue(enc(delta(0)))
+        controller.error(new Error('socket broke'))
+      },
+    })))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const { error } = await drain(await globalThis.fetch(CHAT, jsonInit()))
+    check('an upstream stream failure is passed through', error !== null && error.message === 'socket broke', String(error?.message))
+    check('…and is not counted as a violation', hook.counters.blocked === 0 && hook.state().lastViolation === null, JSON.stringify(hook.counters))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // warn 下同一个失败的流也不该被算成违规（判定只在流正常收尾时发生）。
+  check('the frame splitter accepts LF blank lines', nextFrameEnd(enc('data: {}\n\nrest')) === 'data: {}\n\n'.length)
+  check('the frame splitter accepts CRLF blank lines', nextFrameEnd(enc('data: {}\r\n\r\nrest')) === 'data: {}\r\n\r\n'.length)
+  check('an incomplete frame yields -1', nextFrameEnd(enc('data: {}')) === -1)
+  check('a terminator is recognised among other frames', isTerminatorFrame(enc('data: [DONE]\n\n')) && isTerminatorFrame(enc('data:[DONE]\n\n')))
+  // 只认 `data:` 后最多一个空格 —— 多一格 openai 解码器就不认它是终止帧（它剥掉一个空格后
+  // 看 startsWith('[DONE]')），会把这一帧丢给 JSON.parse 让整条流报错。扣帧范围要和消费者一致。
+  check('…but only with the spacing the consumer accepts', !isTerminatorFrame(enc('data:  [DONE]\n\n')))
+  check('the frame splitter accepts CR-only blank lines', nextFrameEnd(enc('data: {}\r\rrest')) === 'data: {}\r\r'.length)
+  check('content frames are never mistaken for a terminator', !isTerminatorFrame(enc('data: {"a":1}\n\n')))
+}
+
+// ── 14. the streamed gate, attacked ─────────────────────────────────────────
+//
+// 独立审查（2026-09-23，全新上下文的子代理）逐条攻过这个闸。下面是它真的攻破的那一处，
+// 加上几处只能靠回归测试守住的边界：routing 藏在**被扣住**的终止帧里、取消被误记成违规、
+// 块边界落在帧中间、上游不发空行就关流、对抗性的渠道名把错误文案带成「可重试」。
+console.log('\n── 14. the streamed gate, attacked ───────────────────────')
+{
+  const enc = (text) => new TextEncoder().encode(text)
+  const delta = (index) => `data: ${JSON.stringify({ choices: [{ delta: { content: `tok${index}` } }] })}\n\n`
+  const routingFrame = (provider) => `data: ${gatewayBody(provider)}\n\n`
+  const sse = (body) => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  const wire = (parts) => new ReadableStream({
+    start(controller) {
+      for (const part of parts) controller.enqueue(typeof part === 'string' ? enc(part) : part)
+      controller.close()
+    },
+  })
+  /** 把一段字节按给定切点分块：模拟真实的块边界（会落在帧中间）。 */
+  const sliced = (bytes, cuts) => {
+    const parts = []
+    let at = 0
+    for (const cut of [...cuts, bytes.length]) {
+      parts.push(bytes.slice(at, cut))
+      at = cut
+    }
+    return parts
+  }
+  const join = (parts) => {
+    const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0))
+    let at = 0
+    for (const part of parts) {
+      out.set(part, at)
+      at += part.length
+    }
+    return out
+  }
+  const same = (left, right) => left.length === right.length && left.every((byte, index) => byte === right[index])
+  const text = (bytes) => new TextDecoder().decode(bytes)
+  async function drainBytes(response) {
+    const parts = []
+    const reader = response.body.getReader()
+    for (;;) {
+      try {
+        const { done, value } = await reader.read()
+        if (done) return { bytes: join(parts), error: null }
+        parts.push(value)
+      } catch (error) {
+        return { bytes: join(parts), error }
+      }
+    }
+  }
+
+  // 审查里唯一能造出「别家的工具真的执行了」的洞：只扫转发出去的帧，于是藏在**被扣住**
+  // 的终止帧里的 routing 从未被读过，闸拿上一帧的旧结论（deepseek）替它背书。
+  {
+    const hidden = `data: [DONE]\ndata: ${gatewayBody('alibaba')}\n\n`
+    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('deepseek'), hidden])))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    check('routing inside the held terminator frame is judged too', error !== null && /finalProvider=alibaba/.test(error.message), String(error?.message ?? '').slice(0, 90))
+    check('…so a hidden channel blocks the call', hook.counters.blocked === 1, JSON.stringify(hook.counters))
+    check('…and an earlier allowed routing does not excuse it', !text(bytes).includes('[DONE]'), JSON.stringify(text(bytes)).slice(-70))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 反面：藏在终止帧里的 routing 是允许的 → 正常放行（别矫枉过正判成违规）。
+  {
+    const hidden = `data: [DONE]\ndata: ${gatewayBody('deepseek')}\n\n`
+    const stub = stubFetch(() => sse(wire([delta(0), hidden])))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    check('an allowed routing inside the terminator frame still passes', error === null && text(bytes).includes('[DONE]'), String(error?.message ?? ''))
+    check('…and is recorded as verified', hook.state().lastVerified?.provider === 'deepseek', JSON.stringify(hook.state().lastVerified ?? null))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 块边界落在帧中间：`data:` 中间、`[DONE]` 中间、以及最后一个字节单独一块。
+  // 转发必须与线上字节逐字节相同（今天只做了 includes 检查）。
+  {
+    const raw = delta(0) + delta(1) + routingFrame('deepseek') + 'data: [DONE]\n\n'
+    const bytes = enc(raw)
+    const cuts = [1, raw.indexOf('data: [DONE]') + 3, raw.indexOf('[DONE]') + 3, bytes.length - 1]
+    const stub = stubFetch(() => sse(wire(sliced(bytes, cuts))))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const { bytes: got, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    check('a frame split mid-`data:` is forwarded byte-for-byte', error === null && same(got, bytes), `${got.length}/${bytes.length} bytes, error=${String(error?.message ?? 'none')}`)
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // CRLF 帧，且正好切在空行的 `\r` 与 `\n` 之间 —— 切帧只看字节，不能在这里劈错。
+  {
+    const raw = `data: ${JSON.stringify({ choices: [{ delta: { content: 'hi' } }] })}\r\n\r\n`
+      + routingFrame('deepseek').replace(/\n/g, '\r\n')
+      + 'data: [DONE]\r\n\r\n'
+    const bytes = enc(raw)
+    const blank = raw.indexOf('\r\n\r\n') + 3
+    const stub = stubFetch(() => sse(wire(sliced(bytes, [blank]))))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const { bytes: got, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    check('a CRLF frame split between CR and LF stays byte-identical', error === null && same(got, bytes), `${got.length}/${bytes.length} bytes, error=${String(error?.message ?? 'none')}`)
+    check('…and the CRLF terminator is recognised', hook.state().lastVerified?.provider === 'deepseek')
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 上游不发最后的空行就关流：剩下的那一帧照样要判（两个分支此前都没被覆盖过）。
+  {
+    const stub = stubFetch(() => sse(wire([delta(0), `data: ${gatewayBody('deepseek')}`])))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const { error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    check('a final frame with no blank line before EOF is still judged', error === null && hook.state().lastVerified?.provider === 'deepseek', `error=${String(error?.message ?? 'none')}`)
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 两帧 [DONE]：都扣住、通过后一起放行（`hold` 的拼接分支此前没被覆盖）。
+  {
+    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('deepseek'), 'data: [DONE]\n\n', 'data: [DONE]\n\n'])))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    const seen = (text(bytes).match(/\[DONE\]/g) ?? []).length
+    check('two terminator frames are both held and released together', error === null && seen === 2, `seen=${seen}, error=${String(error?.message ?? 'none')}`)
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 声明了 SSE 却没有 body：没法边流边判 → 退回缓冲路径失败关闭（400），而不是抛异常。
+  {
+    const stub = stubFetch(() => new Response(null, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const response = await globalThis.fetch(CHAT, jsonInit())
+    check('an SSE response with no body fails closed with 400', response.status === 400 && /没有 gateway\.routing/.test(await response.text()), `HTTP ${response.status}`)
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 取消（用户按停止）：裁决没发生 —— 记 unverified，**绝不能**算成违规。
+  {
+    const controller = new AbortController()
+    let release
+    const gate = new Promise((resolve) => { release = resolve })
+    const stub = stubFetch(() => sse(new ReadableStream({
+      async start(stream) {
+        stream.enqueue(enc(delta(0)))
+        await gate
+        stream.error(new DOMException('aborted', 'AbortError'))
+      },
+    })))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const pending = drainBytes(await globalThis.fetch(CHAT, { ...jsonInit(), signal: controller.signal }))
+    controller.abort()
+    release()
+    const { error } = await pending
+    check('an aborted stream is not counted as a violation', hook.counters.blocked === 0 && hook.counters.unverified === 1, JSON.stringify(hook.counters))
+    check('…and is recorded as unverified, with why', hook.state().lastUnverified?.reason === 'aborted', JSON.stringify(hook.state().lastUnverified ?? null).slice(0, 130))
+    check('…while the abort still reaches the caller', error !== null, String(error?.message))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 消费者自己取消（dsh 中止 / break）：同样不是违规，也不能在取消后补一次裁决。
+  {
+    const stub = stubFetch(() => sse(new ReadableStream({
+      start(stream) {
+        stream.enqueue(enc(delta(0)))
+      },
+    })))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const reader = (await globalThis.fetch(CHAT, jsonInit())).body.getReader()
+    await reader.read()
+    await reader.cancel('user stopped')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    check('a consumer cancel is not a violation either', hook.counters.blocked === 0 && hook.counters.unverified === 1, JSON.stringify(hook.counters))
+    check('…and never invents a verdict', hook.state().lastVerified === null && hook.state().lastViolation === null)
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 对抗性渠道名：dsh 用正则从错误文案里给失败分类，`channel-500` / `rate_limit` 会被
+  // 归成 SERVER / RATE_LIMIT（都可重试），于是同一条注定被拒的请求被打 8 遍。
+  {
+    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('channel-500')])))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const { error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    check('an adversarial channel name stays out of the classified message', error !== null && !/channel-500/.test(error.message), String(error?.message ?? '').slice(0, 90))
+    check('…so the refusal cannot be classified as retryable', error !== null && !isRetryableFailureText(error.message), String(error?.message ?? '').slice(0, 90))
+    check('…while the raw culprit is still recorded', hook.state().lastViolation?.finalProvider === 'channel-500', JSON.stringify(hook.state().lastViolation ?? null).slice(0, 90))
+    check(
+      'the guard detects exactly the retryable keywords',
+      isRetryableFailureText('provider=channel-500') &&
+        isRetryableFailureText('provider=rate_limit') &&
+        isRetryableFailureText('provider=fetch-timeout') &&
+        !isRetryableFailureText('finalProvider=alibaba，允许的是 deepseek'),
+    )
+    hook.uninstall()
+    stub.restore()
+  }
 }
 
 console.log(`\nRESULT: ${failures.length === 0 ? 'FETCH OK' : `FAILED (${failures.join(' | ')})`}`)

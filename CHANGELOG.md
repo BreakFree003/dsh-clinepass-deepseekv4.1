@@ -1,5 +1,165 @@
 # Changelog
 
+## 0.7.2
+
+**`strict` streams again: the gate withholds only the SSE terminator, so a
+response is displayed as it is generated and the chunk arrival times behind the
+TPS figure survive — while a response from a disallowed channel is still
+discarded before it can reach the model.**
+
+0.7.1 read the whole body to get `gateway.routing`, which only appears in the
+last frame (measured: frame 41 of 41). That was right about the information the
+gate needs and wrong about what it has to withhold: buffering kept non-official
+content out of the context, but it also destroyed the chunk timestamps dsh
+measures decode speed from, so `sessionStats` folded the local drain time as if
+it were generation time. The Token-usage dialog read ~16,000 tok/s where the real
+figure was ~150.
+
+Changed:
+
+- **`strict` forwards content immediately and holds back only `data: [DONE]`.**
+  Frames are passed through byte-for-byte as they arrive; the terminator is
+  released once `gateway.routing` has been judged, and on a violation the
+  response body is errored instead of completed. dsh's pi-ai adapter turns that
+  into an `error` event, so the agent loop appends only an `assistant/attempt` —
+  no `assistant/message` is assembled and no tool call is executed. What changes
+  for the user: a refused answer is now visible before the step fails, where
+  0.7.1 never showed it at all. What does not change: on a stream that ends on
+  its own, it never reaches the model context and no tool acts on it.
+- **`warn` streams too.** It judged the same way but buffered as well; with the
+  terminator held only in `strict`, `warn` is now a usable "diagnose without
+  blocking" mode instead of a second way to lose streaming.
+- **Every frame the gate keeps is also scanned for `routing`, not just the ones
+  it forwards.** Found by an independent adversarial review: a held frame is
+  bytes the gate *retains and later releases*, and a legal two-line SSE frame can
+  carry both `data: [DONE]` and a routing object. Not scanning it meant a foreign
+  routing could be shadowed by an earlier allowed one — the gate released the
+  terminator, pi-ai assembled a message, and a tool call ran (`blocked: 0`). The
+  review reproduced that end to end through the real adapter; the regression test
+  in §14 fails against the pre-fix code.
+- **A cancel is never a verdict.** When the consumer stops reading (user presses
+  stop, or dsh aborts the round), `routing` has usually not arrived yet, so the
+  old code could reach `conclude` on a cancelled stream and record a *false*
+  violation. Cancellation now records `unverified` instead and never judges.
+- The wrapper works on **bytes**: frames are split on the SSE blank line
+  (`\n\n`, `\r\n\r\n` and `\r\r`, matching the SDK's own
+  `findDoubleNewlineIndex`) and decoded only to read `routing`, so the forwarded
+  body is byte-identical — verified against streams chopped mid-`data:`,
+  mid-`[DONE]` and between the `\r` and `\n` of a blank line. `isTerminatorFrame`
+  also follows the consumer's rule exactly (`data:` plus at most one space),
+  instead of a looser one that would hold a frame the SDK then fails to parse.
+- The refusal is delivered with `controller.error()` rather than by throwing
+  inside a `TransformStream`'s `flush`: that path errors the stream through its
+  internal close algorithm and surfaces as an *uncaught exception* when nobody is
+  reading concurrently, which took the host process down (found by
+  `smoke-test.mjs`).
+- The refusal message is checked against dsh's failure classifier before it is
+  thrown. `classifyPiAiError` is a set of regexes over the message, and channel
+  names come from the gateway: a slug containing `429`, `rate_limit`, `500`,
+  `timeout` or `connection` would classify as retryable and make a request that
+  is refused every time be streamed `maxRetries` times. The fixed part of the
+  message was already safe; now the interpolated part is too — if it collides,
+  the error carries a static message and the diagnostic stays in the log and
+  `lastViolation`.
+- `verifyPinned` passes the caller's abort signal into the streaming path, and
+  the upstream body is locked into a reader lazily (only once bytes are actually
+  wanted) rather than eagerly.
+
+Added:
+
+- **`counters.unverified` and `lastUnverified` in the status file**, recording
+  streams that never reached a verdict (`aborted`, `cancelled`, `stream failed`).
+  Before this, a habitually interrupted session could ride a foreign channel with
+  nothing in the status file to show for it.
+- A §13 section in `test-fetch.mjs` for the streamed gate (content arriving
+  before the verdict, the terminator released on success and withheld on a
+  violation, missing routing metadata, `warn`, an upstream failure that is not
+  counted as a violation, the frame splitter) and a §14 section for the cases an
+  adversarial review attacked: routing hidden inside the held terminator frame,
+  cancellation accounting, split frames, no trailing blank line before EOF, two
+  terminator frames, `response.body === null`, and an adversarial channel name
+  against the retry classifier.
+
+Known limits (measured, not hypothetical — these are documented in the README):
+
+- **A stream that is aborted mid-flight is not protected.** `routing` never
+  arrives, no verdict is rendered, and dsh commits the content it already
+  displayed as an interrupted `assistant/message` — which *is* in the next
+  request's context (text and reasoning only; no tool call runs). 0.7.1's
+  buffering did not have this hole because the abort happened before any content
+  was released. This is the one place where streaming costs a safety property;
+  the abort is recorded as `unverified` so it is at least visible.
+- The gate trusts the `routing` the gateway reports about itself. A lying
+  gateway defeats it.
+- Only foreign attempts marked `success: true` are rejected. Whether the gateway
+  marks an attempt that streamed bytes and then failed is unknown (not
+  reproducible offline); if it does, the rule must be tightened.
+
+## 0.7.1
+
+**The gateway stopped honouring `providerOptions.gateway.only`, so the pin is now
+enforced locally: a response that was not served by an allowed channel is
+discarded instead of being handed to the model.**
+
+Measured on 2026-09-22 against `api.cline.bot`: pinning the real channel, pinning
+a channel that cannot exist (`__no_such_upstream__`) and not pinning at all
+produce **byte-identical** `routing` metadata — same `finalProvider: "deepseek"`,
+same `fallbacksAvailable` listing all 15 other channels, same
+`planningReasoning` ("System credentials planned for: deepseek, alibaba, …
+Total execution order: deepseek(system) → alibaba(system) → …"). Nine spellings
+of the pin (`order`, `models`, `sort`, a top-level `only`, `providerOptions.only`,
+snake_case, …) were tried and all were ignored. The request field is still sent —
+it costs nothing and works again the day the gateway restores it — but it no
+longer decides anything.
+
+Added:
+
+- **`enforcement`: `strict` (default) / `warn` / `off`.** In `strict`, a
+  `chat/completions` response is read to the end, the channel that actually
+  served it is taken from `gateway.routing`, and the response is handed on only
+  if `finalProvider` **and every `providerAttempt` that succeeded** are in the
+  allowed list for that model — as is the `resolvedProvider` the gateway reports
+  next to it, so two fields that ever start disagreeing stop the request instead
+  of letting the nicer one be believed. Otherwise the response is dropped and the call
+  fails with HTTP 400 `PROVIDER_PIN_VIOLATION` — no content from an unlisted
+  channel ever reaches the model context. `warn` judges the same way but only
+  logs and counts; `off` skips the check and the buffering entirely. The status
+  code is deliberately a 4xx: dsh's default retry set is
+  `EMPTY_RESPONSE`/`RATE_LIMIT`/`SERVER`/`TIMEOUT`/`TRANSPORT`, so a 5xx would be
+  retried eight times for a request that will be refused every time. Non-2xx
+  upstream responses pass through untouched — a failed call has no content to
+  "use", and rewriting it would hide quota and rate-limit signals.
+- **`counters.blocked`, `lastVerified`, `lastViolation` and `enforcement` in the
+  status file.** `lastVerified` records who the gateway said served the last
+  accepted request; `lastViolation` records the refusal (including the
+  `finalProvider` that did not match and the fallback list), so "did it quietly
+  switch channels?" is answerable from one file.
+- A `state()` accessor on the hook, and a 4b section in `test-fetch.mjs` covering
+  refusal, `warn`, `off`, missing routing metadata and upstream errors — the gate
+  is now tested offline, without touching the gateway.
+
+Changed:
+
+- **`strict` costs streaming.** The routing metadata arrives only in the last SSE
+  frame (measured: frame 41 of 41), so "never use an unlisted channel" requires
+  buffering the whole response and releasing it afterwards: answers appear at the
+  end instead of token by token. That is the tradeoff `strict`-by-default buys;
+  `enforcement: warn` is the way to keep the diagnosis without the blocking, and
+  it buffers too. `off` is the only mode that still streams.
+- The accepted response is **rebuilt** from the buffered body (`content-encoding`
+  and `content-length` removed) instead of being passed through by identity, and
+  a caller abort (`AbortSignal`) propagates as an abort rather than being counted
+  as a channel violation.
+- `smoke-test.mjs` no longer asserts `fallbacksAvailable` is empty — that
+  asserted the gateway behaviour that no longer exists, so it could only ever
+  fail. It now reports the fallback list as a notice and asserts that the local
+  gate accepted the live response; a new section proves the gate refuses a
+  deliberately mismatched allow-list. `--negative` still fails on purpose (the
+  impossible-channel pin proves nothing now).
+- A disposed plugin instance no longer rewrites the status file with
+  `hook: "uninstalled"` while requests still flow through its layer after a
+  reload: the record belongs to the instance that owns `globalThis.fetch`.
+
 ## 0.7.0
 
 **The plugin grows a browser half: a usage card on Settings → Models. The pin,

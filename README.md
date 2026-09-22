@@ -56,6 +56,78 @@ dsh ──pi-ai──> https://api.cline.bot/api/v1   （进程内改写请求�
 
 只有落到 `upstream` 这一个 origin 的 `chat/completions` 会被改写；**其它 provider 的请求连对象都不会被复制**（同一个 `init` 原样传给原函数）。
 
+## 钉选现在由本地兑现（2026-09-22 起，**必读**）
+
+`providerOptions.gateway.only` 是 [Vercel AI Gateway 文档](https://vercel.com/docs/ai-gateway/models-and-providers/provider-options)里的「钉住渠道」写法，
+`api.cline.bot` 曾经执行它。**现在不再执行了。** 实测（2026-09-22）：
+
+| 请求里的 only | HTTP | 响应里的 `routing.finalProvider` | `fallbacksAvailable` |
+| --- | --- | --- | --- |
+| `['deepseek']` | 200 | `deepseek` | **15 个渠道** |
+| `['__no_such_upstream__']`（不可能存在） | 200 | `deepseek` | **15 个渠道** |
+| 完全不传 | 200 | `deepseek` | **15 个渠道** |
+
+三种请求的 `routing` 元数据逐字相同，`planningReasoning` 都是
+`System credentials planned for: deepseek, alibaba, … Total execution order: deepseek(system) → alibaba(system) → …`
+—— 规划器把全部 16 个 system 渠道按顺序排进计划，`only` 连痕迹都没有。一共试过 15 种写法
+（`order` / `models` / `sort` / 顶层 `only` / 顶层 `provider: { only }` /
+`provider: { order, allow_fallbacks: false }` / `providerOptions.only` / snake_case / 双写 …），
+`routing` 的字段集合每次都一模一样。
+
+最决定性的一条是 **`sort`**：[Vercel 文档](https://vercel.com/docs/ai-gateway/models-and-providers/provider-filtering-and-ordering)
+写明 `sort` 生效时响应元数据里会出现 `gateway.routing.sort`。实测发 `sort: "cost"` /
+`sort: "ttft"`，`routing` 里**没有** `sort` 字段 —— 也就是说整个 provider 路由选项块都被
+网关丢掉了，不是「写法不对」。所以 **「钉到 DeepSeek 官方渠道」不能靠请求字段实现**，
+只能由本插件在本地兑现。
+
+### 本地闸怎么工作
+
+1. 照旧注入 `providerOptions.gateway.only`（成本为零；网关哪天恢复执行就自动生效）；
+2. 响应**逐帧立即转发**，只把 SSE 的终止帧 `data: [DONE]` 扣在手里；
+3. 终止帧到达（或上游关流）时，从 `routing` 里取出真正服务这次请求的渠道：`finalProvider`
+   与**每一个成功过的 `providerAttempt`** 都必须在允许列表里（中途换过渠道的话，前半段内容
+   来自别家），网关同时给出的 `resolvedProvider` 也一起查 —— 两个字段只要有一个指向别家就拒。
+   通过才放行终止帧；违规就让响应体**报错**，这次调用作废。
+
+为什么是「撤回」而不是「先缓冲再放行」：`routing` 只在**最后一帧**才出现（实测第 41/41 帧），
+早一刻都拿不到，所以要么牺牲流式、要么在拿到结论之前先让内容出去。后者才是可用的那条 ——
+内容虽然显示过，但**装配之前**这次调用就已经作废：dsh 只落一条 `assistant/attempt`（没有
+surface op，不进上下文），绝不会装配 `assistant/message`，于是工具也不会执行。用缓冲换来的
+「一次都不显示」代价太大：它同时毁掉了 dsh 用来算输出速度（TPS）的分片到达时间，面板会把
+本地排空耗时当成生成耗时（实测 16,000+ tok/s，真值 ~150）。
+
+违规的报错带 `code: PROVIDER_PIN_VIOLATION`。刻意避开 `rate` / `timeout` / `network` /
+`fetch` / 5xx 这类关键词：dsh 用正则给失败分类，命中就会被默认重试策略当成可重试错误，把
+同一条注定被拒的请求打 8 遍。**动态部分（渠道名来自网关）也过一遍同样的判定**：万一撞上
+这些字样，抛出的文案就退回不含它的版本，诊断原文仍在日志与 `lastViolation` 里。
+非 2xx 的上游响应一律原样放行（那是一次失败的调用，没有内容会被「使用」，改写它会掩盖
+配额/限流信号）；非 SSE（一次性 JSON）的响应没有流式可言，仍是读完再判、违规返回 HTTP 400。
+
+**撤回能覆盖的**是「流自己走完」的情况：校验发生在收尾之前，违规时内容不进上下文、工具
+不执行。它覆盖不了这些（都是实测过的边界，不是理论担忧）：
+
+- **中途被中止的流**（用户按停止 / 父级 interrupt）：`routing` 还没到，裁决没有发生，而
+  dsh 会把已经显示出去的那部分**当成「被打断的回复」记进上下文**（`interrupted: true` 的
+  `assistant/message`，只含文字与推理，不含工具调用）。0.7.1 的缓冲实现里中止发生在内容放
+  出去之前，所以没有这个口子 —— 这是换回真实 TPS 的一处**退让**。这类流会被记成
+  `counters.unverified` / `lastUnverified`（`reason: "aborted"`），不至于悄悄发生。
+- **网关自报的 `routing`**：闸信的是网关给的那段元数据。网关说谎或链路被换掉，本地无从
+  证明 —— 这是「只看上游自述」的固有边界。
+- **只有 `success: true` 的非允许 attempt 会被拒**：「先试别家失败、再由官方渠道服务」是
+  正常重试，拒掉会误伤；而「失败前已经吐过字节」那种形状还没在网关上实测到，真遇到要把
+  规则收紧成「出现任何非允许渠道的 attempt 就拒」。
+
+### 想只告警 / 想关掉
+
+```yaml
+# profile 的 cordis.patch.yml 里那条 clinepass 行
+- id: clinepass
+  config:
+    enforcement: warn   # strict（默认）| warn | off
+```
+
+`off` 不扣终止帧也不校验：回到「请求字段钉选 + 没有任何校验」的旧行为（它本来就是流式的）。
+
 插件启动时还会**自动登记**那条 provider profile：不存在就创建；如果它认得出是自己建的那张卡、只是地址过期了（例如从旧版反代换过来后地址还指着 `127.0.0.1:8791`），就只把地址改回来；认不出（是别人/手工建的）就原样不动并在日志里报警。
 
 ---
@@ -248,6 +320,7 @@ ClinePass 剩余用量                 更新于 15:25  刷新
 | `displayName` | `Cline Pass` | 选择器里的名字 |
 | `contextWindow` / `maxTokens` | `921600` / `131072` | 模型容量，登记 profile 时使用 |
 | `apiKeyEnv` | `CLINE_PASS_API_KEY` | profile 里记录的凭据引用 |
+| `enforcement` | `strict` | 边流边校验响应是否真由允许的渠道提供：`strict` = 违规就在终止帧之前中断这条流、这次调用作废（内容已显示，但不进上下文、不执行工具）；`warn` = 同样校验但只告警放行；`off` = 不校验、不扣终止帧 |
 | `provision` | `true` | 启动时自动登记 provider profile（缺失则创建；自家卡片地址过期则只修地址） |
 | `alignReasoningEffort` | `true` | 若 `agent-default-model.reasoningEffort` 不是本模型声明的档位（只剩 `high` / `max` 两个），启动时对齐：废弃的 `xhigh` → `max`，其它不认识的值 → `high` |
 | `plainModelId` | `true` | 提示词（persona 两段）里显示**去掉本路由前缀**的 id：`cline-pass/deepseek-v4.1-flash` → `deepseek-v4.1-flash`。线上 id、会话记录、选择器都不受影响；`false` 则原样显示完整 id |
@@ -278,18 +351,22 @@ cat ~/.dsh/dsh-clinepass-status.json     # 正在跑的 dsh 自己写的状态�
 #   "service": "dsh-clinepass", "transport": "fetch", "hook": "installed",
 #   "upstream": "https://api.cline.bot", "pin": ["deepseek"],
 #   "profileBaseURL": "https://api.cline.bot/api/v1",
-#   "counters": { "seen": 4, "pinned": 4, "skipped": 0 },
+#   "counters": { "seen": 4, "pinned": 4, "skipped": 0, "blocked": 0, "unverified": 0 },
 #   "lastPin": { "model": "cline-pass/deepseek-v4.1-flash", "only": ["deepseek"] },
+#   "enforcement": "strict",
+#   "lastVerified": { "at": "…", "url": "…/chat/completions", "provider": "deepseek",
+#                     "allowed": ["deepseek"], "attempts": 1 },
+#   "lastViolation": null, "lastUnverified": null,
 #   "ignoredOptions": [], "pid": 1234, "at": "2026-09-15T11:13:13.910Z"
 # }
 
 node test-package.mjs       # 打包不变量：bundle 声明可用、无生命周期脚本、bundle 行与安装器行不漂移、client 半边声明可用
-node test-fetch.mjs         # 单元测试：URL 域限定/透传保真/安装卸载/请求体形态/robustness/状态文件 + 经真 fetch(undici) 打本地 server 的集成
+node test-fetch.mjs         # 单元测试：URL 域限定/透传保真/安装卸载/请求体形态/robustness/状态文件 + 流式闸（逐帧放行、扣住终止帧、违规中断、藏在终止帧里的 routing、取消不许算成违规、块边界逐字节保真）+ 经真 fetch(undici) 打本地 server 的集成
 node test-settings.mjs      # 配置面（含已删除选项）、profile 登记与修复、档位迁移
 node test-usage.mjs         # 用量：响应收窄、网关读取、路由处理器（缓存/去重/失败分类/key 不外泄）、apply 接线、client bundle 契约
 node test-install.mjs       # 安装器/卸载器往返测试（幂等、注释不丢、逐字节还原）
-node smoke-test.mjs         # 冒烟：读状态文件确认活着的 dsh 挂着钩子 + 经真网关跑一轮，断言 finalProvider=deepseek
-node smoke-test.mjs --negative   # 追加反向对照：不可能渠道必须被拒绝
+node smoke-test.mjs         # 冒烟：读状态文件确认活着的 dsh 挂着钩子 + 经真网关跑一轮（断言 finalProvider=deepseek 且本地闸放行）+ 用错配的允许列表证明闸真的会拒
+node smoke-test.mjs --negative   # 追加反向对照：不可能渠道必须被拒绝（网关已不执行 only，这条**预期 FAIL**）
 ```
 
 没有测试框架，全是自带断言的 Node 脚本（零依赖）。`npm test` 跑前五个，**五个都不需要网络**；
@@ -301,9 +378,9 @@ undici、但只连 `127.0.0.1`；`test-usage.mjs` 连那个都不需要 —— �
 要求**正在运行**的 dsh。
 
 
-`hook` 字段就是「静默失效」的报警器：`installed` = 钩子在全局 fetch 上；`uninstalled` = 被卸载了；`unavailable` = 装不进去（有东西先替换了 fetch，日志里会报，这种情况现在没有备用 transport 可切，要先找出是哪个插件抢了全局 fetch）；`foreign` = 装好之后有别的代码把全局 fetch 换掉了（插件每 30 秒自查一次，所以最迟半分钟内可见；换掉之后请求就不再被钉）。`counters.seen` 是落到本网关的 chat 请求数，`pinned` 是真正注入了钉选的请求数 —— **`seen` 涨而 `pinned` 不涨**就说明有请求被跳过了（日志里有 `[clinepass] not pinning ...` 的原因）。状态文件里**不含任何凭据**，并且只有当前持有全局 fetch 的那个插件实例会写它。
+`hook` 字段就是「静默失效」的报警器：`installed` = 钩子在全局 fetch 上；`uninstalled` = 被卸载了；`unavailable` = 装不进去（有东西先替换了 fetch，日志里会报，这种情况现在没有备用 transport 可切，要先找出是哪个插件抢了全局 fetch）；`foreign` = 装好之后有别的代码把全局 fetch 换掉了（插件每 30 秒自查一次，所以最迟半分钟内可见；换掉之后请求就不再被钉）。`counters.seen` 是落到本网关的 chat 请求数，`pinned` 是真正注入了钉选的请求数 —— **`seen` 涨而 `pinned` 不涨**就说明有请求被跳过了（日志里有 `[clinepass] not pinning ...` 的原因）。`counters.blocked` 是被本地闸拦下的响应数；`counters.unverified` 是**没能校验**的流数（用户按停止、socket 断 —— 裁决根本没发生，见下面「已知边界」），配上 `lastUnverified` 一个都不该被读成「一切正常」；`lastVerified` 记最后一次校验通过时**网关说它交给了谁**，`lastViolation` 记最后一次拦截（含 `finalProvider` 与实际列出的 fallback）—— 这几个字段就是「有没有偷偷换渠道」的直接证据。状态文件里**不含任何凭据**，并且只有当前持有全局 fetch 的那个插件实例会写它。
 
-`smoke-test.mjs` 会先读状态文件确认**正在运行的 dsh** 里钩子是 `installed`、且计数器在动（pid 已退出/`hook: uninstalled` 时会明确说明它只能验到哪一步；记录里的 pid 存活才作数），确认本插件没有监听任何本地端口，再用同一份插件代码在测试进程里注入一次、打真网关断言 `finalProvider: "deepseek"`。
+`smoke-test.mjs` 会先读状态文件确认**正在运行的 dsh** 里钩子是 `installed`、且计数器在动（pid 已退出/`hook: uninstalled` 时会明确说明它只能验到哪一步；记录里的 pid 存活才作数），确认本插件没有监听任何本地端口，再用同一份插件代码在测试进程里注入一次、打真网关断言 `finalProvider: "deepseek"` 且这条响应确实通过了本地闸；最后用一份**故意错配**的允许列表（允许 `alibaba`、实际由 `deepseek` 服务）证明闸真的会拒 —— 拒绝时必须是 HTTP 400 + `PROVIDER_PIN_VIOLATION`，且响应体里一个 `data:` 帧都没有（模型输出没被放出去）。
 
 `provision` 字段说明 provider 卡片的登记结果：`created`（新建）/ `present`（已存在）/ `repaired`（地址过期已修正）/ `mismatch`（那张卡片不是本插件建的，未改动；请求会绕过钉选，需要你手动改地址）/ `failed`（settings 写入失败，日志里会有原因）。
 

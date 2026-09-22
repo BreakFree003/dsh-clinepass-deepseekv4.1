@@ -62,10 +62,50 @@ if (yaml === null) {
   process.exit(1)
 }
 
-const readYaml = (file) => (fs.existsSync(file) ? yaml.load(fs.readFileSync(file, 'utf8')) : undefined)
-const settings = readYaml(path.join(DSH_HOME, 'settings.yaml')) ?? {}
+/**
+ * 0.1.7 起补丁文档里会有 `!!js` 表达式（本机的本地 preset 是从随包 standard 冻结来的，
+ * 带着 `disabled: !!js process.platform === 'win32'` 这类行）。js-yaml 默认 schema 遇到
+ * 未知 tag 会对**整个文件**抛错，脚本一行断言都跑不到就退出 —— 这里把该 tag 认下来，
+ * 构造一个标记对象（本脚本只读 `llm-pi-ai` 那条，不需要真的求值表达式）。
+ */
+const jsTag = new yaml.Type('tag:yaml.org,2002:js', {
+  kind: 'scalar',
+  construct: (expression) => ({ __js: expression }),
+})
+const YAML_SCHEMA = yaml.DEFAULT_SCHEMA.extend([jsTag])
+
+const readYaml = (file) =>
+  fs.existsSync(file)
+    ? yaml.load(fs.readFileSync(file, 'utf8'), { schema: YAML_SCHEMA })
+    : undefined
+
+/**
+ * Where does this dsh version keep user settings?
+ *
+ * 0.1.6 and earlier: `$DSH_HOME/settings.yaml` (a standalone document).
+ * 0.1.7+: the settings were merged into the **profile's patch document**
+ * `$DSH_HOME/profiles/<profile>/cordis.patch.yml`, section id = loader entry id
+ * (new package `dsh-config-editor` writes there). The old file is renamed to
+ * `settings.yaml.imported` and may not exist at all.
+ *
+ * Both are checked, newest first, so this script keeps working across the move.
+ * @returns the cline-pass provider profile and where it came from.
+ */
+function readProviderProfile() {
+  const patchFile = path.join(DSH_HOME, 'profiles', PROFILE, 'cordis.patch.yml')
+  const rows = readYaml(patchFile)
+  if (Array.isArray(rows)) {
+    const fromPatch = rows.find((row) => row?.id === 'llm-pi-ai')?.config?.providers?.[PROVIDER]
+    if (fromPatch !== undefined) return { profile: fromPatch, source: patchFile, ns: 'llm-pi-ai' }
+  }
+  const legacyFile = path.join(DSH_HOME, 'settings.yaml')
+  const fromLegacy = readYaml(legacyFile)?.['llm-pi-ai']?.providers?.[PROVIDER]
+  if (fromLegacy !== undefined) return { profile: fromLegacy, source: legacyFile, ns: 'llm-pi-ai' }
+  return { profile: undefined, source: patchFile, ns: 'llm-pi-ai' }
+}
+
 const credentials = readYaml(path.join(DSH_HOME, '.credentials.yaml')) ?? {}
-const profile = settings['llm-pi-ai']?.providers?.[PROVIDER]
+const { profile, source: settingsSource } = readProviderProfile()
 
 const failures = []
 const check = (label, ok, detail) => {
@@ -74,8 +114,10 @@ const check = (label, ok, detail) => {
 }
 
 if (profile === undefined) {
-  console.error(`dsh-clinepass smoke: settings has no llm-pi-ai.providers.${PROVIDER}.`)
+  console.error(`dsh-clinepass smoke: ${settingsSource} has no llm-pi-ai.providers.${PROVIDER}.`)
   console.error('Start dsh once with the plugin mounted (it provisions the profile), or add it on Settings → Models.')
+  console.error('If you just upgraded to 0.1.7+, check ~/.dsh/settings.yaml.imported: the settings migration')
+  console.error('renames settings.yaml before its first write, so a failed import never retries.')
   process.exit(1)
 }
 
@@ -87,6 +129,7 @@ const origin = baseURL.replace(/\/api\/v1\/?$/, '').replace(/\/+$/, '')
 
 console.log('── inputs ────────────────────────────────────────────────')
 console.log(`  DSH_HOME     : ${DSH_HOME}`)
+console.log(`  read from    : ${settingsSource}`)
 console.log(`  profile      : llm-pi-ai.providers.${PROVIDER}`)
 console.log(`  baseURL      : ${baseURL}`)
 console.log(`  model        : ${modelId}`)
@@ -256,17 +299,77 @@ if (key === undefined) {
   check('no stream error', streamError === null, String(streamError).slice(0, 120))
   check('model answered', content.trim().length > 0, JSON.stringify(content.trim().slice(0, 40)))
   check('served by deepseek', routing?.finalProvider === 'deepseek', String(routing?.finalProvider))
+  // 2026-09-22 起 api.cline.bot **不再执行** providerOptions.gateway.only：钉真渠道、钉假
+  // 渠道、完全不钉，routing 元数据逐字相同，fallbacksAvailable 永远列出全部渠道。所以这里
+  // 不再断言网关的钉选行为（那个行为已经不存在，断言它只会永远红），而是把事实打出来，
+  // 并断言「这条响应确实通过了本地闸」—— 闸的拒绝行为由第 3 节证明。
+  if (Array.isArray(routing?.fallbacksAvailable) && routing.fallbacksAvailable.length > 0) {
+    console.log(`       注意：网关的 routing 仍列出 ${routing.fallbacksAvailable.length} 个 fallback 渠道 —— only 已不被执行，钉选由本地闸兑现`)
+  }
+  const gateSawIt = hook.state().lastVerified
   check(
-    'no fallback channels were available',
-    Array.isArray(routing?.fallbacksAvailable) && routing.fallbacksAvailable.length === 0,
-    JSON.stringify(routing?.fallbacksAvailable),
+    'the local gate verified this response',
+    gateSawIt !== null && gateSawIt.provider === 'deepseek',
+    JSON.stringify(gateSawIt ?? null).slice(0, 140),
   )
   if (routing?.planningReasoning !== undefined) console.log(`       planningReasoning: ${String(routing.planningReasoning).slice(0, 110)}`)
 }
 
-// ── 3. the pin is load-bearing (optional) ───────────────────────────────────
+// ── 3. the local gate ───────────────────────────────────────────────────────
+//
+// 网关不再执行 providerOptions.gateway.only（见 README「网关不再执行 only」一节），
+// 所以「钉住官方渠道」现在由插件在本地兑现：边流边读 routing，读出真正服务它的渠道，
+// 不在允许列表里就让这条流在收尾前**中断**。这一节用一个**故意错配**的允许列表来证明
+// 闸是活的：允许 alibaba，而网关的 routing 一定说 deepseek → 必须拒。
+console.log('\n── 3. the gate refuses a non-pinned response ─────────────')
+{
+  const { createFetchPin: makeHook } = await import('./index.js')
+  hook?.uninstall()
+  const gate = makeHook(
+    { upstream: origin, statusFile: false, pin: ['alibaba'] },
+    {
+      info: () => {},
+      warn: () => {},
+      error: (line, ...rest) => console.log(`       ${String(line).replace(/%s/g, () => String(rest.shift() ?? ''))}`),
+    },
+  )
+  gate.install()
+  const response = await fetch(`${baseURL}/chat/completions`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'text/event-stream' },
+    body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'Reply with exactly: OK' }], stream: true, max_tokens: 64 }),
+  })
+  // SSE 的拒法是**中断响应体**：HTTP 状态在第一帧内容出去时就定死了，所以状态仍是 200；
+  // 内容边流边显示，但终止帧被扣住，消费端读到的是失败而不是一次正常收尾。
+  let refusal = null
+  let received = ''
+  try {
+    received = await response.text()
+  } catch (error) {
+    refusal = error
+  }
+  check('a streamed response from a channel we did not allow fails', refusal !== null, String(refusal?.message ?? '').slice(0, 120))
+  check(
+    'the failure is identifiable',
+    String(refusal?.code) === 'PROVIDER_PIN_VIOLATION' && /渠道校验未通过/.test(String(refusal?.message)),
+    `${refusal?.code}: ${String(refusal?.message ?? '').slice(0, 100)}`,
+  )
+  check('the refused stream never reaches a completion', !/\[DONE\]/.test(received), received.slice(-140))
+  check('the refusal is counted', gate.counters.blocked === 1, String(gate.counters.blocked))
+  const state = gate.state()
+  check(
+    'the violation records who actually served it',
+    state.lastViolation !== null && state.lastViolation.finalProvider === 'deepseek',
+    JSON.stringify(state.lastViolation ?? null).slice(0, 160),
+  )
+  check('the violation records why it was refused', /alibaba/.test(String(state.lastViolation?.reason)), String(state.lastViolation?.reason ?? ''))
+  gate.uninstall()
+  hook?.install()
+}
+
+// ── 4. the pin field itself (optional) ──────────────────────────────────────
 if (argv.includes('--negative')) {
-  console.log('\n── 3. negative control (impossible channel) ──────────────')
+  console.log('\n── 4. negative control (impossible channel) ──────────────')
   const gateway = String(profile.baseURL ?? '').replace(new RegExp(`^${origin}`), '')
   const upstream = process.env.CLINE_UPSTREAM ?? 'https://api.cline.bot'
   // Deliberately through the unwrapped fetch: a hook would overwrite the
