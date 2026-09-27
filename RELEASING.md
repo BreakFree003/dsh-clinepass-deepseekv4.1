@@ -84,7 +84,13 @@ shasum -a 256 /tmp/dl.tgz dsh-clinepass-<version>.tgz
 
 # 3) 解包后：版本号对、index.js 与仓库 HEAD 一致、打包不变量仍然成立
 cd /tmp && tar xzf dl.tgz && grep '"version"' package/package.json && node package/test-package.mjs
+
+# 4) 只动文档的版本：代码没动这件事要与**上一个 tag** 比，不是与 HEAD 比
+#    （和 HEAD 比只能证明工作区干净 —— 每次发版都成立，什么也证明不了）
+shasum -a 256 index.js && git show v<上一个版本>:index.js | shasum -a 256
 ```
+
+两个哈希不同就说明这次并不是「只动文档」，把版本段和 release 正文改回来说实话。
 
 ## 7. 收尾
 

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.6
+
+Documentation only — `index.js` is byte-for-byte the file 0.7.5 shipped (compared
+against the previous tag, per the check added below).
+
+- **The README now names the actual reason plugin log lines land nowhere.** It
+  said "where the log ends up is the host's decision", which reads like a
+  configuration problem the reader could fix; there is no logger exporter in this
+  composition at all, so `ctx.logger` output never leaves the process, while a
+  plugin that prints through `console.log` (the neighbouring one does) reaches
+  `~/Library/Logs/dsh-web.log`. That asymmetry is exactly what made this look like
+  a silent plugin. Reading the status file is not a workaround here — it is the
+  only surface there is.
+- Two places that sent the reader to the log first now lead with the status file:
+  the interception record (`lastViolation.finalProvider`) and the case where the
+  card is not ours (`provision: "mismatch"` plus `provisionReason`).
+- **`RELEASING.md` gained the check this session needed**: a docs-only release has
+  to prove the runtime did not change by comparing `index.js` against the
+  *previous tag*. Comparing against HEAD only proves the working tree is clean,
+  which is true of every release, docs-only or not.
+
 ## 0.7.5
 
 **dsh 0.1.7 removed `settings.get()`, and provisioning died on it.** The write

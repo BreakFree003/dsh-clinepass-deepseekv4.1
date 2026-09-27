@@ -110,8 +110,9 @@ surface op，不进上下文），绝不会装配 `assistant/message`，于是�
 配额，最后才是 `classifyPiAiError`（可重试的那几类会被按 `maxRetries` 重打）。**溢出那条还会
 触发会话压缩**。渠道名由网关给，把它插进文案就是给被审方改判词的机会：一个叫
 `context_length_exceeded` 的渠道名足以让 dsh 去压缩你的会话。诊断信息并不少，只是换了地方：
-插件日志里有一行带渠道名的 error，状态文件的 `lastViolation` 有 `finalProvider` 与 fallback
-列表，错误对象的 `detail` 属性也有。**别给文案加护栏正则**：判定有好几套、随时会增补，护栏
+状态文件的 `lastViolation` 有 `finalProvider` 与 fallback
+列表（插件日志里另有一行同样的 error —— 但那些行**不落盘**，见下面「验证」里的「关于日志」），错误对象的
+`detail` 属性也有。**别给文案加护栏正则**：判定有好几套、随时会增补，护栏
 必然滞后；这里的保证是「文案里没有任何动态内容」，由测试用「换任何渠道名文案都必须逐字相同」
 钉住。
 
@@ -146,7 +147,7 @@ surface op，不进上下文），绝不会装配 `assistant/message`，于是�
 
 `off` 不扣终止帧也不校验：回到「请求字段钉选 + 没有任何校验」的旧行为（它本来就是流式的）。
 
-插件启动时还会**自动登记**那条 provider profile：不存在就创建；如果它认得出是自己建的那张卡、只是地址过期了（例如从旧版反代换过来后地址还指着 `127.0.0.1:8791`），就只把地址改回来；认不出（是别人/手工建的）就原样不动并在日志里报警。
+插件启动时还会**自动登记**那条 provider profile：不存在就创建；如果它认得出是自己建的那张卡、只是地址过期了（例如从旧版反代换过来后地址还指着 `127.0.0.1:8791`），就只把地址改回来；认不出（是别人/手工建的）就原样不动并报警 —— 状态文件里是 `provision: "mismatch"` 加上一句 `provisionReason`。
 
 ---
 
@@ -183,7 +184,7 @@ dsh plugin --profile web remove dsh-clinepass
 要锁版本就带上 tag（不带则取默认分支的最新提交）：
 
 ```sh
-dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1#v0.7.5
+dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1#v0.7.6
 ```
 
 > 这条路径要求 PATH 上有 `pnpm` —— `dsh plugin` 本身就是 pnpm 转发器。
@@ -424,11 +425,13 @@ undici、但只连 `127.0.0.1`；`test-usage.mjs` 连那个都不需要 —— �
 里就是那句话**（`present` / `created` 时为 `null`）—— 它和日志行同源，但一定落盘。`provision` 在**三个地方**都能看到：
 状态文件、插件启动日志那一行（`… pin deepseek (profile present); prompt shows …`）、以及 `smoke-test.mjs` 读到的内存态。
 
-**关于日志。** 插件把请求、拦截、登记结果打成 dsh 的插件日志 —— 但**日志落到哪里由宿主决定**：本仓库的开发机上，
-launchd 启动的 `dsh web` 里别的插件（自己用 `console.log` 打印的那种）会出现在 `~/Library/Logs/dsh-web.log`，
-而这个插件的 `ctx.logger` 行**一行都没有**。所以排查请以**状态文件为准**：`hook`、`counters`、`provision`、
-`lastVerified`、`lastViolation`、`lastUnverified`、`lastSkipped` 里都有答案；下面凡提到「日志」的地方，都是这条的补充，
-而不是前提。
+**关于日志。** 插件把请求、拦截、登记结果打成 dsh 的插件日志（`ctx.logger`）—— 但**这份 composition 里没有
+任何 logger exporter**，`ctx.logger` 的输出于是**根本不离开进程，哪里都不落**：这不是配置写错了，也没有开关可
+打开。对照很直接：同一个 `dsh web` 里，邻居插件（自己用 `console.log` 打印的那种）的行会出现在
+`~/Library/Logs/dsh-web.log`，本插件的 `ctx.logger` 行**一行都没有** —— `console` 走 launchd 捕获的
+stdout/stderr，`ctx.logger` 走那个不存在的 exporter。所以排查请以**状态文件为准**：`hook`、`counters`、
+`provision`、`provisionReason`、`lastVerified`、`lastViolation`、`lastUnverified`、`lastSkipped` 里都有答案；
+下面凡提到「日志」的地方，都是这条的补充，而不是前提。
 
 ## 实战记录：一次真实的拦截（2026-09-28）
 
@@ -505,7 +508,7 @@ reasoning、**两个 `bash` 工具调用**的完整参数，最后是 `usage` �
 - **不监听任何端口**：插件只包一层 `globalThis.fetch`，且只改写发往 `upstream` 的 `chat/completions`。用量功能加的是 dsh **自己那台 HTTP 服务**上的一条路径（`/api/clinepass.usage`，见上），插件进程里没有 `listen`，也没有第二个 socket。
 - 插件**不持有** API key —— key 由 dsh 从凭据库取出、写进请求头，插件只加一个路由字段。状态文件里只有服务与钩子状态、上游与 profile 地址、计数与时间、模型名、钉选渠道和 pid：**没有任何密钥**，`test-fetch.mjs` 里有一条断言专门守着这一点。
 - **用量读取里的 key 也不外泄**：宿主用 `Authorization: Bearer <key>` 问网关，然后把响应收窄成三个数字再返回。浏览器拿到的 JSON 里没有 key，DOM 里也没有；`test-usage.mjs` 有两条断言守着（key 不出现在任何返回值里、只出现在那一个请求头里）。这条路在 dsh 自己的 Host/Origin 信任栅栏与浏览器 cookie 认证之后才派发。
-- 日志只打印请求方法/URL/模型/钉选渠道（形如 `[clinepass] → #004 POST https://api.cline.bot/api/v1/chat/completions pinned to deepseek (model …, in-process)`），以及配置/登记结果与「没钉上的原因」。**请求头从不进日志** —— `authorization` 没有被打印的机会，也就不存在"脱敏"这一步。用量那一路同理：只记「注册了哪条路径」和「读取意外失败」，不记 key、不记响应体。**这些行是否落到文件里取决于宿主的日志配置**（见「验证」里的「关于日志」），所以同一个结论也写进了状态文件。
+- 日志只打印请求方法/URL/模型/钉选渠道（形如 `[clinepass] → #004 POST https://api.cline.bot/api/v1/chat/completions pinned to deepseek (model …, in-process)`），以及配置/登记结果与「没钉上的原因」。**请求头从不进日志** —— `authorization` 没有被打印的机会，也就不存在"脱敏"这一步。用量那一路同理：只记「注册了哪条路径」和「读取意外失败」，不记 key、不记响应体。**这些行是否落到文件里取决于 composition 里有没有 logger exporter**（这一份没有 —— 见「验证」里的「关于日志」），所以同一个结论也写进了状态文件。
 - 旧版的 `captureDir` 会把请求/响应原文（含对话内容）落盘，该功能已随反代一起删除。
 
 ## 与 npm 上 `dsh-cline-pass` 的区别
@@ -549,7 +552,7 @@ node uninstall.mjs --keep-provider  # 保留设置页那张卡片
 
 **Architecture.** The route is an ordinary **pi-ai provider profile** (`llm-pi-ai.providers.cline-pass`, OpenAI-compatible, key from the credential store) — which is exactly why dsh renders a native provider card with a key field for it. The plugin only adds `providerOptions.gateway.only` to outgoing requests, leaving streaming, tool calls, reasoning, usage and images on pi-ai's proven path. The pin is injected **in-process**: the plugin wraps `globalThis.fetch` for the life of the process and rewrites **only** this gateway's chat-completions bodies — **no listener, no port, nothing to configure for transport**. (0.5.0 removed the optional loopback reverse proxy; a config still naming `transport` / `listen` / `captureDir` is reported once and ignored.) Only requests to the configured `upstream` origin are ever touched, and unrelated calls are passed through as the exact same arguments. On start the plugin also **provisions** the profile (repairing only a recognisably-own stale address, never overwriting a foreign one) and aligns an unsupported stored reasoning level. Since 0.6.2 it also keeps the gateway's `type/` prefix out of the **prompt**: a prepended `system-prompt/assemble` listener rewrites the `{{model}}` reference in the two persona sections, so the persona reads `deepseek-v4.1-flash` while the wire, the session records and the model picker keep `cline-pass/deepseek-v4.1-flash` (`plainModelId: false` turns this off). Since **0.7.0** the Cline Pass card on Settings → Models also shows **usage**: the 5-hour, weekly and monthly windows as progress bars of what is **left**, with the remaining percent, the reset countdown and the read time (the gateway only reports `percentUsed`, so remaining is `100 − percentUsed`, computed in the browser half and rounded to one decimal so `100 − 82.4` cannot print `17.599999999999994`). `client.js` is the browser half — a hand-written bundle (no build step, like `dsh-notify-ping`) that registers into dsh's documented `settings.models.provider-card` slot; the **host** half reads `GET https://api.cline.bot/api/v1/users/me/plan/usage-limits` with the stored key and publishes only the resulting numbers at `/api/clinepass.usage`, an exact Fetch route on the HTTP server dsh **already runs** — a new *path*, still no listener of ours. The browser cannot read the key by design (dsh's credential seam is write-only), which is exactly why the card needs a host half.
 
-**Install.** `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1` — the package declares `dsh.bundle.patch`, so `dsh plugin` (a pnpm forwarder) installs it and appends it to `dsh.profile.bundles` on its own: no clone, no hand-edited patch. Append `#v0.7.5` to pin a tag. Without pnpm, `node install.mjs` copies the plugin into the profile and appends the loader row instead (idempotent + backed up) — use one route or the other, never both. Restart dsh either way, then set the key on Settings → Models. Configuration defaults are complete — `upstream`, `pin`, `pins`, `provider`, `model`, `apiKeyEnv`, `provision`, `alignReasoningEffort`, `plainModelId`, `usage`, `usageRoute`, `usageTimeoutMs`, `usageCacheMs`, `statusFile`. **No third-party dependencies**: the host half imports only Node built-ins and the browser half only asks for React from the shell's static module table.
+**Install.** `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1` — the package declares `dsh.bundle.patch`, so `dsh plugin` (a pnpm forwarder) installs it and appends it to `dsh.profile.bundles` on its own: no clone, no hand-edited patch. Append `#v0.7.6` to pin a tag. Without pnpm, `node install.mjs` copies the plugin into the profile and appends the loader row instead (idempotent + backed up) — use one route or the other, never both. Restart dsh either way, then set the key on Settings → Models. Configuration defaults are complete — `upstream`, `pin`, `pins`, `provider`, `model`, `apiKeyEnv`, `provision`, `alignReasoningEffort`, `plainModelId`, `usage`, `usageRoute`, `usageTimeoutMs`, `usageCacheMs`, `statusFile`. **No third-party dependencies**: the host half imports only Node built-ins and the browser half only asks for React from the shell's static module table.
 
 **Verify.** `cat ~/.dsh/dsh-clinepass-status.json` — the running dsh writes its hook state and counters there (`hook`, `provision`, `seen`/`pinned`/`skipped`, `lastSkipped`, `lastVerified`/`lastViolation`), which is how a silently bypassed hook becomes visible — and that file, not the log, is what to rely on: whether this plugin's `ctx.logger` lines reach a file at all depends on how the host was started (on the development machine, other plugins that print via `console` land in the launchd log while these do not); `node test-package.mjs` (packaging invariants: the bundle declaration is installable, no lifecycle scripts, the bundle and installer rows cannot drift, and the client-half declaration is loadable), `node test-fetch.mjs` (URL scoping, pass-through fidelity, install/uninstall and reload semantics, body shapes, robustness, status file, integration through the real fetch), `node test-settings.mjs` (the option surface, provisioning and the effort migration), `node test-usage.mjs` (response narrowing, the gateway read, the route handler's caching/dedupe/failure classification and key containment, the `apply` wiring), `node test-install.mjs` (install/uninstall round trips), `node smoke-test.mjs [--negative]` (checks the live process's status file, then runs a real gateway round trip asserting `finalProvider: "deepseek"` and that the local gate accepted the response). To check the usage half against the live process, open the page with its token and GET `/api/clinepass.usage` — it should answer `{"ok":true,"limits":[…]}`.
 
