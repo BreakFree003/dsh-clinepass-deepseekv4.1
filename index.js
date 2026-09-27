@@ -72,6 +72,31 @@ export const KEY_REF = 'CLINE_PASS_API_KEY'
 export const PROFILE_PATH = '/api/v1'
 
 /**
+ * 读一个命名空间当前的 live 值。
+ *
+ * dsh 0.1.7 起，settings 服务（`SettingsForms`）暴露的是 `describe()` / `update()` /
+ * `replace()` / `mutate()` —— **`get()` 被移除了**。0.1.7-rc.2 上直接调
+ * `settings.get(ns)` 会抛 `settings.get is not a function`，于是 provider 卡片永远登记不上
+ * （这正是 `provision: "failed"` 的真身）。`describe()` 的每一项自带 `value`
+ * （类型注释：*"One Loader entry's live Config fields"*），所以读值走它；`get()` 只作为更早
+ * 宿主的兜底留着。
+ *
+ * @param settings - settings 服务（或测试替身）。
+ * @param ns - 命名空间 / profile entry id。
+ * @returns 该命名空间的 live 值，读不到时为 `undefined`。
+ */
+function readNamespace(settings, ns) {
+  try {
+    const rows = settings.describe?.()
+    const entry = Array.isArray(rows) ? rows.find((row) => row.ns === ns) : undefined
+    if (entry !== undefined && entry.value !== undefined) return entry.value
+  } catch {
+    /* 读不到就走下面的兜底 */
+  }
+  return settings.get?.(ns)
+}
+
+/**
  * `lastSkipped.reason` 里那条「配置本来就是空的」的文案。
  *
  * `pin: []` 是**合法**配置（纯透传，README 的配置项一节写着），所以它不该被读成一次故障；
@@ -377,12 +402,12 @@ const RETIRED_EFFORTS = { xhigh: 'max' }
  * @param settings - the settings service.
  * @param cfg - the complete plugin configuration.
  * @param logger - where to report.
- * @returns `'ok' | 'aligned' | 'absent' | 'other-provider' | 'failed'`.
+ * @returns `'ok' | 'aligned' | 'absent' | 'other-provider' | 'other-model' | 'failed'`.
  */
 export async function alignReasoningEffort(settings, cfg, logger = console) {
   const ns = 'agent-default-model'
   try {
-    const current = settings.get?.(ns)
+    const current = readNamespace(settings, ns)
     if (current === null || typeof current !== 'object') return 'absent'
     if (current.provider !== cfg.provider) return 'other-provider'
     // The effort belongs to a model; another model on the same route may well
@@ -1155,6 +1180,8 @@ export function createFetchPin(config, logger = console) {
   let lastSkipped = null
   /** provider profile 的登记结果，由 {@link noteProvision} 在 apply 里填。 */
   let provision = null
+  /** 与 `provision` 配套的一句话（`failed` / `mismatch` / `repaired` 的原因）。 */
+  let provisionReason = null
 
   /** The base URL the provider profile must point at: the gateway itself. */
   const profileBaseURL = () => `${cfg.upstream}${PROFILE_PATH}`
@@ -1186,6 +1213,7 @@ export function createFetchPin(config, logger = console) {
           transport: 'fetch',
           hook: hookState,
           provision,
+          provisionReason,
           upstream: cfg.upstream,
           pin: cfg.pin,
           profileBaseURL: profileBaseURL(),
@@ -1678,12 +1706,13 @@ export function createFetchPin(config, logger = console) {
     /**
      * 当前校验状态的一份快照（冒烟测试与排查用；status 文件写的是同一批字段）。
      *
-     * @returns `{ counters, enforcement, provision, lastPin, lastVerified, lastViolation, lastUnverified, lastSkipped }`。
+     * @returns `{ counters, enforcement, provision, provisionReason, lastPin, lastVerified, lastViolation, lastUnverified, lastSkipped }`。
      */
     state: () => ({
       counters: { ...counters },
       enforcement: cfg.enforcement,
       provision,
+      provisionReason,
       lastPin,
       lastVerified,
       lastViolation,
@@ -1750,9 +1779,11 @@ export function createFetchPin(config, logger = console) {
      * 的地方（README「验证」一节记了这条），所以同一个结论也落进状态文件。
      *
      * @param value - `provisionProfile()` 的返回值，或 `'off'` / `'unavailable'`。
+     * @param reason - 一句话说明，`'present'` / `'created'` 时为 null。
      */
-    noteProvision(value) {
+    noteProvision(value, reason = null) {
       provision = value
+      provisionReason = reason
       publish()
     },
     /** The status file path, or null when it is disabled. */
@@ -1775,9 +1806,12 @@ const OWNERSHIP_CHECK_MS = 30_000
  * @param settings - the settings service.
  * @param cfg - the complete plugin configuration.
  * @param logger - where to report.
+ * @param note - 收到「值得写进状态文件的一句话」时被调用（见 `hook.noteProvision`）。
+ *   日志行有两个问题：宿主的 logger 不一定落到用户看得到的地方，而 `'failed'` / `'mismatch'`
+ *   单看一个词也说明不了什么。所以同一个结论走两条路：日志照旧，状态文件拿这句话。
  * @returns `'created' | 'present' | 'repaired' | 'mismatch' | 'failed'`.
  */
-export async function provisionProfile(settings, cfg, logger = console) {
+export async function provisionProfile(settings, cfg, logger = console, note = () => {}) {
   const revision = () => settings.describe?.({ redactSecrets: true })?.find((entry) => entry.ns === PROFILE_NS)?.revision
   const attempt = async () => {
     const profile = {
@@ -1798,7 +1832,7 @@ export async function provisionProfile(settings, cfg, logger = console) {
         },
       ],
     }
-    const existing = settings.get(PROFILE_NS)?.providers?.[cfg.provider]
+    const existing = readNamespace(settings, PROFILE_NS)?.providers?.[cfg.provider]
     if (existing === undefined) {
       await settings.mutate(PROFILE_NS, [{ op: 'set', path: ['providers', cfg.provider], value: profile }], revision())
       logger.info?.('[clinepass] provisioned "%s" on Settings → Models (%s) — add your API key there', cfg.provider, profile.baseURL)
@@ -1806,7 +1840,9 @@ export async function provisionProfile(settings, cfg, logger = console) {
     }
     // A scalar where a profile belongs is a broken route, not a healthy one.
     if (typeof existing !== 'object' || existing === null) {
-      logger.warn?.('[clinepass] the "%s" provider profile is not an object (%s); fix it on Settings → Models', cfg.provider, JSON.stringify(existing))
+      const detail = `the "${cfg.provider}" provider profile is not an object (${JSON.stringify(existing)}); fix it on Settings → Models`
+      note(detail)
+      logger.warn?.('[clinepass] %s', detail)
       return 'mismatch'
     }
 
@@ -1853,6 +1889,9 @@ export async function provisionProfile(settings, cfg, logger = console) {
       const stranded = typeof existing.baseURL === 'string' && /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)(:\d+)?(\/|$)/i.test(existing.baseURL)
       if (!addressSame && stranded) {
         await settings.mutate(PROFILE_NS, [{ op: 'set', path: ['providers', cfg.provider, 'baseURL'], value: profile.baseURL }], revision())
+        note(
+          `the "${cfg.provider}" profile pointed at a local address nothing listens on (${String(existing.baseURL)}); moved it to ${profile.baseURL}. Its api/apiKeyEnv are not the ones this plugin writes, so nothing else was touched — check the key on Settings → Models`,
+        )
         logger.warn?.(
           '[clinepass] the "%s" profile points at a local address nothing listens on (%s); moved it to %s. Its api/apiKeyEnv are not the ones this plugin writes, so nothing else was touched — check the key on Settings → Models',
           cfg.provider,
@@ -1861,6 +1900,9 @@ export async function provisionProfile(settings, cfg, logger = console) {
         )
         return 'repaired'
       }
+      note(
+        `the "${cfg.provider}" provider profile is not the one this plugin wrote (api/apiKeyEnv differ), so it is left alone; it points at ${String(existing.baseURL)}, not ${profile.baseURL} — fix it on Settings → Models or requests will bypass the pin`,
+      )
       logger.warn?.(
         '[clinepass] the "%s" provider profile is not the one this plugin wrote (api/apiKeyEnv differ), so it is left alone; it points at %s, not %s — fix it on Settings → Models or requests will bypass the pin',
         cfg.provider,
@@ -1874,10 +1916,12 @@ export async function provisionProfile(settings, cfg, logger = console) {
     if (!displaySame) ops.push({ op: 'set', path: ['providers', cfg.provider, 'displayName'], value: profile.displayName })
     if (!levelsSame) ops.push({ op: 'set', path: ['providers', cfg.provider, 'models'], value: nextModels })
     await settings.mutate(PROFILE_NS, ops, revision())
+    const repaired = [!addressSame ? `address → ${profile.baseURL}` : null, !displaySame ? 'display name' : null, !levelsSame ? 'model entry' : null].filter(Boolean).join(', ')
+    note(`repaired the "${cfg.provider}" profile (${repaired})`)
     logger.info?.(
       '[clinepass] repaired the "%s" profile (%s)',
       cfg.provider,
-      [!addressSame ? `address → ${profile.baseURL}` : null, !displaySame ? 'display name' : null, !levelsSame ? 'model entry' : null].filter(Boolean).join(', '),
+      repaired,
     )
     return 'repaired'
   }
@@ -1891,6 +1935,7 @@ export async function provisionProfile(settings, cfg, logger = console) {
     try {
       return await attempt()
     } catch (retryError) {
+      note(`could not provision the "${cfg.provider}" profile: ${retryError instanceof Error ? retryError.message : String(retryError)}`)
       logger.warn?.('[clinepass] could not provision the "%s" profile: %s', cfg.provider, retryError instanceof Error ? retryError.message : String(retryError))
       return 'failed'
     }
@@ -2041,17 +2086,21 @@ export async function apply(ctx, config) {
   }
 
   let provision = 'off'
+  let provisionReason = null
   if (cfg.provision) {
     const settings = ctx.settings ?? ctx.get?.('settings')
     if (settings === undefined || typeof settings.mutate !== 'function') {
       provision = 'unavailable'
+      provisionReason = 'the settings service is not available in this composition, so the provider profile was neither read nor written'
       logger.warn?.('[clinepass] settings service unavailable; the "%s" provider profile was not provisioned', cfg.provider)
     } else {
-      provision = await provisionProfile(settings, cfg, logger)
+      provision = await provisionProfile(settings, cfg, logger, (reason) => {
+        provisionReason = reason
+      })
       if (cfg.alignReasoningEffort) await alignReasoningEffort(settings, cfg, logger)
     }
   }
-  hook.noteProvision(provision)
+  hook.noteProvision(provision, provisionReason)
 
   // `pending` until the child fiber below reports, `off` when the option is
   // disabled; only `installed` is announced as a route the browser may call.

@@ -34,8 +34,10 @@ function makeSettings(value, { revision = 3, ns = 'llm-pi-ai' } = {}) {
   const writes = []
   return {
     writes,
-    get: () => value,
-    describe: () => [{ ns, revision }],
+    // 0.1.7 removed `get()`; the live value rides on the descriptor now. The
+    // double models the host that is actually current, so the suite exercises
+    // the path a running dsh takes.
+    describe: () => [{ ns, revision, value }],
     mutate: async (target, ops, expectedRevision) => {
       writes.push({ ns: target, ops, expectedRevision })
       return { kind: 'written' }

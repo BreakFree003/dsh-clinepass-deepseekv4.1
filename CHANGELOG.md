@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.7.5
+
+**dsh 0.1.7 removed `settings.get()`, and provisioning died on it.** The write
+that puts the Cline Pass card on Settings → Models reads the current card first;
+it did so with `settings.get(PROFILE_NS)`. On dsh 0.1.7-rc.2 the settings service
+is `SettingsForms`, which exposes `describe()` / `update()` / `replace()` /
+`mutate()` and **no `get()`** — so the call threw `settings.get is not a
+function`, the retry threw the same way, and `provision` settled at `failed`. A
+fresh install on the current dsh therefore got **no provider card at all**: the
+route could not be picked, and the pin had nothing to attach to.
+
+Found within minutes of 0.7.4 going live, by the field 0.7.4 added. 0.7.4 records
+the verdict; this release records the sentence beside it, so the status file said
+`provision: "failed"` and `provisionReason: 'could not provision the "cline-pass"
+profile: settings.get is not a function'` on the first reload. 0.7.4 had called
+this a 0.1.7-era anecdote that could not be reproduced — it reproduced
+immediately, and this is why.
+
+- **The live value is read from `describe()`**, whose entries carry `value` (the
+  service's own type calls it "One Loader entry's live Config fields"), with
+  `settings.get?.()` kept as the fallback for hosts that predate the change. Both
+  shapes have tests, and the suite's settings doubles now model the *current* host
+  by default: putting `settings.get()` back fails five assertions.
+- **`alignReasoningEffort` was silently dead on the same API change.** It called
+  `settings.get?.(ns)` — optional chaining, so on 0.1.7 it read `undefined` and
+  returned `'absent'`, skipping the stored-effort migration without a word. It
+  goes through the same reader now.
+- **`provisionReason`** joins the status file and `state()`: the sentence behind
+  `failed` / `mismatch` / `repaired`, produced by `provisionProfile()` through a
+  callback so it can never exist only as a log line. `'present'` / `'created'`
+  carry `null`.
+- Also corrects `alignReasoningEffort`'s documented return union, which omitted
+  `'other-model'` — a value the code has always been able to return.
+
+Verified on the machine that found it: with this release mounted, the same status
+file flips to `provision: "present"` / `provisionReason: null`, and
+`settings.yaml` is left untouched, because that deployment declares the card
+itself.
+
 ## 0.7.4
 
 **The two questions the README answered with "look at the log" are now answered

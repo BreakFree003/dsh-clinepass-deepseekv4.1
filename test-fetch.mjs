@@ -498,20 +498,26 @@ console.log('\n── 7. robustness ──────────────�
 // ── 8. provisioning on the portless transport ───────────────────────────────
 console.log('\n── 8. provisioning ───────────────────────────────────────')
 {
-  const makeSettings = (value, { revision = 7 } = {}) => {
+  const makeSettings = (value, { revision = 7, legacyGet = false } = {}) => {
     const writes = []
-    return {
+    const double = {
       writes,
-      get: () => value,
-      describe: () => [{ ns: 'llm-pi-ai', revision }],
+      // 0.1.7's `SettingsForms` has no `get()`: the live value is on the descriptor.
+      // `legacyGet` models the host before that, to keep the fallback covered.
+      describe: () => [{ ns: 'llm-pi-ai', revision, value }],
       mutate: async (ns, ops, expectedRevision) => {
         writes.push({ ns, ops, expectedRevision })
         return { kind: 'written' }
       },
     }
+    if (legacyGet) double.get = () => value
+    return double
   }
   const cfg = withDefaults({})
   cfg.baseURL = `${cfg.upstream}/api/v1`
+
+  const legacyRead = makeSettings({ providers: { deepseek: {} } }, { legacyGet: true })
+  check('a host that only exposes get() still provisions', (await provisionProfile(legacyRead, cfg, recorder())) === 'created', JSON.stringify(legacyRead.writes))
 
   const empty = makeSettings({ providers: { deepseek: {} } })
   check('the profile is created without a local address', (await provisionProfile(empty, cfg, recorder())) === 'created')
@@ -562,7 +568,36 @@ console.log('\n── 8. provisioning ──────────────
   check('…and the address is untouched', upgrading.writes[0].ops.length === 1 && upgrading.writes[0].ops[0].path.join('.') === 'providers.cline-pass.models')
 
   const customFetchProfile = makeSettings({ providers: { 'cline-pass': { api: 'openai-completions', apiKeyEnv: 'SOMEONE_ELSES_KEY', baseURL: 'https://api.cline.bot/api/v1' } } })
-  check('a card this plugin did not write is never rewritten', (await provisionProfile(customFetchProfile, cfg, recorder())) === 'mismatch' && customFetchProfile.writes.length === 0)
+  const mismatchNotes = []
+  check(
+    'a card this plugin did not write is never rewritten',
+    (await provisionProfile(customFetchProfile, cfg, recorder(), (reason) => mismatchNotes.push(reason))) === 'mismatch' && customFetchProfile.writes.length === 0,
+  )
+  check(
+    '…and the reason travels beside the verdict, not only into the log',
+    mismatchNotes.length === 1 && mismatchNotes[0].includes('not the one this plugin wrote') && mismatchNotes[0].includes('SOMEONE_ELSES_KEY') === false,
+    JSON.stringify(mismatchNotes),
+  )
+
+  // A settings service that refuses the write: the verdict alone ("failed") says
+  // nothing an operator can act on, and the log line may land nowhere.
+  const refusing = {
+    get: () => ({}),
+    describe: () => [{ ns: 'llm-pi-ai', revision: 7 }],
+    mutate: async () => {
+      throw new Error('No configurable plugin entry "llm-pi-ai"')
+    },
+  }
+  const failureNotes = []
+  check(
+    'a refused settings write is reported as failed',
+    (await provisionProfile(refusing, cfg, recorder(), (reason) => failureNotes.push(reason))) === 'failed',
+  )
+  check(
+    '…carrying the message that explains it',
+    failureNotes.length === 1 && failureNotes[0].includes('No configurable plugin entry') && failureNotes[0].startsWith('could not provision'),
+    JSON.stringify(failureNotes),
+  )
 
   // An install written for the removed loopback transport still boots: the
   // options are reported and ignored (never fatal), and the card is repaired to
@@ -601,6 +636,17 @@ console.log('\n── 9. status file ──────────────�
     'the provisioning result reaches the status file, not only the log',
     read().provision === 'present' && hook.state().provision === 'present',
     JSON.stringify({ file: read().provision, state: hook.state().provision }),
+  )
+  check(
+    'a clean provisioning carries no reason',
+    read().provisionReason === null && hook.state().provisionReason === null,
+    JSON.stringify(read().provisionReason),
+  )
+  hook.noteProvision('failed', 'could not provision the "cline-pass" profile: No configurable plugin entry "llm-pi-ai"')
+  check(
+    'a failed provisioning carries the sentence that explains it',
+    read().provision === 'failed' && /No configurable plugin entry/.test(read().provisionReason ?? '') && hook.state().provisionReason === read().provisionReason,
+    JSON.stringify({ file: read().provisionReason, state: hook.state().provisionReason }),
   )
   check(
     'nothing is recorded as skipped before anything is skipped',
