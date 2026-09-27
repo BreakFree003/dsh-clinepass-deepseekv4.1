@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.7.4
+
+**The two questions the README answered with "look at the log" are now answered
+by the status file.** Those diagnostics only ever existed as `ctx.logger` lines,
+and whether such a line reaches a file is the host's decision — on the machine
+this plugin is developed on they do not (the neighbouring plugin that *does*
+appear in the launchd log prints through `console`, not through `ctx.logger`).
+"`seen` is climbing but `pinned` is not" and "did the provider card get
+provisioned?" were exactly the two questions the status file could not answer.
+
+Added:
+
+- **`lastSkipped` in the status file and in `state()`** — `{ at, url, reason }`
+  for the most recent request that went out unpinned. The reason is produced in
+  one place now: `rewrite()` returns `{ kind: 'skip', reason }` instead of
+  `null`, and the counter, the record and the log line all happen at the single
+  call site that consumes it, so they cannot drift apart.
+- **`provision` in the status file and in `state()`** — the provider-profile
+  result (`created` / `present` / `repaired` / `mismatch` / `failed` / `off` /
+  `unavailable`), published by a new `hook.noteProvision()` as soon as `apply`
+  has run it. It used to exist only in the startup log line.
+- Tests for both, **proven to fail under mutation**: removing either field from
+  the published payload fails four assertions, and removing the skip record
+  fails the two that read it.
+
+Documentation, from reading the docs against a live install:
+
+- **「方式 C」copied four files while the manifest references six.** `client.js`
+  (the browser half since 0.7.0) and `cordis.patch.yml` were missing from the
+  list, yet `package.json` — which declares both — was copied. The list now
+  includes `client.js` and says what it is for and what is deliberately left
+  out.
+- **A missing provider card has a remedy now, not only a cause.** The
+  development machine hit exactly that on dsh 0.1.7: the plugin reported a
+  successful create, `settings.yaml` never showed `llm-pi-ai`, and the model
+  picker kept a dead entry. It is deployed with `llm-pi-ai.providers` written by
+  hand in the profile patch. Documented as a fallback rather than a version
+  verdict — it was not reproduced on the current release.
+- **`provision` was described as a status-file field** in 0.7.0-0.7.3, which it
+  was not until this release; and wherever the log and the status file overlap,
+  the README now leads with the status file and notes that plugin log lines may
+  land nowhere at all.
+
 ## 0.7.3
 
 **Documentation only — `index.js` is byte-identical to 0.7.2.** Corrects places

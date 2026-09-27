@@ -72,6 +72,14 @@ export const KEY_REF = 'CLINE_PASS_API_KEY'
 export const PROFILE_PATH = '/api/v1'
 
 /**
+ * `lastSkipped.reason` 里那条「配置本来就是空的」的文案。
+ *
+ * `pin: []` 是**合法**配置（纯透传，README 的配置项一节写着），所以它不该被读成一次故障；
+ * 但它确实会让 `seen` 涨而 `pinned` 不涨，所以状态文件里得说清是哪一种。
+ */
+const NOTHING_TO_PIN = 'nothing to pin: the allowed-channel list for this model is empty (pin: [] is a pass-through)'
+
+/**
  * The ClinePass usage-limits endpoint, as a path below `upstream`.
  *
  * Cline's own dashboard reads this path; it is **not** in the public Enterprise
@@ -1143,6 +1151,10 @@ export function createFetchPin(config, logger = console) {
   let lastVerified = null
   let lastViolation = null
   let lastUnverified = null
+  /** 最近一次「这个请求没被钉上」以及原因（README 让用户按 seen/pinned 查的就是它）。 */
+  let lastSkipped = null
+  /** provider profile 的登记结果，由 {@link noteProvision} 在 apply 里填。 */
+  let provision = null
 
   /** The base URL the provider profile must point at: the gateway itself. */
   const profileBaseURL = () => `${cfg.upstream}${PROFILE_PATH}`
@@ -1173,6 +1185,7 @@ export function createFetchPin(config, logger = console) {
           service: 'dsh-clinepass',
           transport: 'fetch',
           hook: hookState,
+          provision,
           upstream: cfg.upstream,
           pin: cfg.pin,
           profileBaseURL: profileBaseURL(),
@@ -1182,6 +1195,7 @@ export function createFetchPin(config, logger = console) {
           lastVerified,
           lastViolation,
           lastUnverified,
+          lastSkipped,
           // Config keys that were read and ignored, so an upgrade from the
           // port era is visible even where plugin warnings are not.
           ignoredOptions: cfg.ignoredOptions ?? [],
@@ -1209,37 +1223,30 @@ export function createFetchPin(config, logger = console) {
    *
    * @param input - fetch input.
    * @param init - fetch init.
-   * @returns `{ kind: 'init', init }` or `{ kind: 'request', request }`, or null.
+   * 返回值里 `{ kind: 'skip', reason }` 是**唯一**的「没钉上」形状：原因在这里产生，由调用方
+   * 记进状态文件并打日志。计数与落盘都只发生在调用方那一处，免得两边各加一次。
+   *
+   * @returns `{ kind: 'init', init }`、`{ kind: 'request', request }` 或 `{ kind: 'skip', reason }`。
    */
   async function rewrite(input, init) {
     const direct = init ?? {}
     const hasOwnBody = direct.body !== undefined
     if (hasOwnBody) {
       const { text, skip } = bodyText(direct.body)
-      if (skip !== undefined) {
-        logger.warn?.('[clinepass] not pinning request #%s: %s', counters.seen, skip)
-        return null
-      }
+      if (skip !== undefined) return { kind: 'skip', reason: skip }
       const next = pinnedBody(text, cfg)
-      if (next.text === undefined) {
-        if (next.problem !== undefined) logger.warn?.('[clinepass] not pinning request #%s: %s', counters.seen, next.problem)
-        return null
-      }
+      if (next.text === undefined) return { kind: 'skip', reason: next.problem ?? NOTHING_TO_PIN }
       return { kind: 'init', init: { ...direct, body: next.text, headers: withoutBodyLength(direct.headers ?? input?.headers) }, next }
     }
     // A `Request` carries its own body; rebuild it with the pinned one, keeping
     // the method, headers and signal it was constructed with.
     if (typeof Request === 'function' && input instanceof Request) {
       const next = pinnedBody(await input.clone().text(), cfg)
-      if (next.text === undefined) {
-        if (next.problem !== undefined) logger.warn?.('[clinepass] not pinning request #%s: %s', counters.seen, next.problem)
-        return null
-      }
+      if (next.text === undefined) return { kind: 'skip', reason: next.problem ?? NOTHING_TO_PIN }
       const headers = withoutBodyLength(direct.headers ?? input.headers)
       return { kind: 'request', request: new Request(input, { ...direct, body: next.text, headers }), next }
     }
-    logger.warn?.('[clinepass] not pinning request #%s: it carries no readable body', counters.seen)
-    return null
+    return { kind: 'skip', reason: 'it carries no readable body' }
   }
 
   /** Log the request the way a capture would. */
@@ -1573,9 +1580,13 @@ export function createFetchPin(config, logger = console) {
     counters.seen += 1
     return rewrite(input, init).then(
       (next) => {
-        if (next === null) {
+        if (next.kind === 'skip') {
+          // 唯一的 skipped 计数与落盘处：状态文件里的 lastSkipped 正是「seen 涨、pinned 不涨」
+          // 时要看的那条原因（日志行是附带的，宿主的 logger 不一定显示给用户）。
           counters.skipped += 1
+          lastSkipped = { at: new Date().toISOString(), url, reason: next.reason }
           publish()
+          logger.warn?.('[clinepass] not pinning request #%s: %s', counters.seen, next.reason)
           return passThrough(input, init)
         }
         counters.pinned += 1
@@ -1592,6 +1603,11 @@ export function createFetchPin(config, logger = console) {
       },
       (error) => {
         counters.skipped += 1
+        lastSkipped = {
+          at: new Date().toISOString(),
+          url,
+          reason: `pin hook failed: ${error instanceof Error ? error.message : String(error)}`,
+        }
         publish()
         logger.warn?.(
           '[clinepass] ✗ pin hook failed (%s); sending the request unpinned',
@@ -1662,15 +1678,17 @@ export function createFetchPin(config, logger = console) {
     /**
      * 当前校验状态的一份快照（冒烟测试与排查用；status 文件写的是同一批字段）。
      *
-     * @returns `{ counters, enforcement, lastPin, lastVerified, lastViolation }`。
+     * @returns `{ counters, enforcement, provision, lastPin, lastVerified, lastViolation, lastUnverified, lastSkipped }`。
      */
     state: () => ({
       counters: { ...counters },
       enforcement: cfg.enforcement,
+      provision,
       lastPin,
       lastVerified,
       lastViolation,
       lastUnverified,
+      lastSkipped,
     }),
     /** Re-check whether the hook still owns `globalThis.fetch` (also runs on a timer). */
     checkOwnership,
@@ -1724,6 +1742,18 @@ export function createFetchPin(config, logger = console) {
       hookState = 'uninstalled'
       publish()
       return 'restored'
+    },
+    /**
+     * 记下 provider profile 的登记结果。
+     *
+     * 这个结论原本只出现在启动日志那一行里；宿主的 logger 不一定把插件日志写到用户看得到
+     * 的地方（README「验证」一节记了这条），所以同一个结论也落进状态文件。
+     *
+     * @param value - `provisionProfile()` 的返回值，或 `'off'` / `'unavailable'`。
+     */
+    noteProvision(value) {
+      provision = value
+      publish()
     },
     /** The status file path, or null when it is disabled. */
     statusPath,
@@ -2021,6 +2051,7 @@ export async function apply(ctx, config) {
       if (cfg.alignReasoningEffort) await alignReasoningEffort(settings, cfg, logger)
     }
   }
+  hook.noteProvision(provision)
 
   // `pending` until the child fiber below reports, `off` when the option is
   // disabled; only `installed` is announced as a route the browser may call.

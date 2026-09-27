@@ -591,6 +591,22 @@ console.log('\n── 9. status file ──────────────�
   check('install publishes the hook state', read().hook === 'installed' && read().transport === 'fetch', JSON.stringify(read().hook))
   check('an install with no legacy options publishes an empty ignored list', JSON.stringify(read().ignoredOptions) === '[]', JSON.stringify(read().ignoredOptions))
   check('the counters start at zero', read().counters.pinned === 0 && read().lastPin === null)
+  check(
+    'the provisioning result starts unrecorded',
+    read().provision === null && hook.state().provision === null,
+    JSON.stringify({ file: read().provision, state: hook.state().provision }),
+  )
+  hook.noteProvision('present')
+  check(
+    'the provisioning result reaches the status file, not only the log',
+    read().provision === 'present' && hook.state().provision === 'present',
+    JSON.stringify({ file: read().provision, state: hook.state().provision }),
+  )
+  check(
+    'nothing is recorded as skipped before anything is skipped',
+    read().lastSkipped === null && hook.state().lastSkipped === null,
+    JSON.stringify(read().lastSkipped),
+  )
 
   await globalThis.fetch(CHAT, jsonInit())
   const afterPin = read()
@@ -598,6 +614,21 @@ console.log('\n── 9. status file ──────────────�
   check('the last pin is described', afterPin.lastPin?.model === CHAT_BODY.model && JSON.stringify(afterPin.lastPin?.only) === '["deepseek"]', JSON.stringify(afterPin.lastPin))
   await globalThis.fetch(CHAT, { method: 'POST', body: 'not json' })
   check('a skipped request is counted too', read().counters.skipped === 1 && read().counters.seen === 2, JSON.stringify(read().counters))
+  // The reason used to live only in a `logger.warn` line, and whether those lines
+  // reach a file at all depends on the host (the README records a deployment where
+  // they do not). `seen` climbing while `pinned` does not has to be answerable from
+  // the status file alone.
+  const afterSkip = read()
+  check(
+    'a skipped request records why, and which request',
+    afterSkip.lastSkipped?.reason === 'the body is not JSON' && afterSkip.lastSkipped?.url === CHAT,
+    JSON.stringify(afterSkip.lastSkipped),
+  )
+  check(
+    '…with a timestamp, and in the in-process state too',
+    typeof afterSkip.lastSkipped?.at === 'string' && hook.state().lastSkipped?.reason === afterSkip.lastSkipped.reason,
+    JSON.stringify(hook.state().lastSkipped),
+  )
   check('the status never carries a credential', !JSON.stringify(read()).includes('sk_test'))
 
   hook.uninstall()
