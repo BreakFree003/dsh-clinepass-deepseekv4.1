@@ -11,6 +11,9 @@ API key 在 **设置 → 模型** 里直接填，卡片上还带一条 **5 小�
 > `fetch`）；上游哪天改掉这一点，插件会**静默失效**——下面的状态文件
 > （`hook: installed`）就是为这件事准备的报警器。装之前建议先读「验证」一节。
 > 能跑测试不代表上游永远不变。
+>
+> 维护者发版走 [RELEASING.md](./RELEASING.md) 里的清单 —— **tag 和 GitHub Release 是两件事**，
+> 只推 tag 的话 Releases 页面会是空的。
 
 ---
 
@@ -69,7 +72,7 @@ dsh ──pi-ai──> https://api.cline.bot/api/v1   （进程内改写请求�
 
 三种请求的 `routing` 元数据逐字相同，`planningReasoning` 都是
 `System credentials planned for: deepseek, alibaba, … Total execution order: deepseek(system) → alibaba(system) → …`
-—— 规划器把全部 16 个 system 渠道按顺序排进计划，`only` 连痕迹都没有。一共试过 15 种写法
+—— 规划器把全部 16 个 system 渠道按顺序排进计划，`only` 连痕迹都没有。写法换过很多种
 （`order` / `models` / `sort` / 顶层 `only` / 顶层 `provider: { only }` /
 `provider: { order, allow_fallbacks: false }` / `providerOptions.only` / snake_case / 双写 …），
 `routing` 的字段集合每次都一模一样。
@@ -149,9 +152,10 @@ surface op，不进上下文），绝不会装配 `assistant/message`，于是�
 
 ## 环境要求
 
-- dsh `0.1.6-alpha.1`（**唯一实测过的版本**）。注意 npm 上**没有** `0.1.5` 这个版本，只有
+- dsh：实测过 `0.1.6-alpha.1`（本插件主要是在它上面开发与验证的）和 `0.1.7-rc.2`（下面
+  「实战记录」那一节所在的机器跑的就是它）。注意 npm 上**没有** `0.1.5` 这个版本，只有
   `0.1.5-alpha.*` / `0.1.5-rc.*`；`dsh plugin` 与 `dsh.bundle` 相关的模块从 `0.1.2-alpha.3`
-  的包里就已存在，但更早的版本没有实测过，不保证。
+  的包里就已存在，但那些更早的版本没有实测过，不保证。
 - Node.js ≥ 20
 - 一个 Cline Pass API key（`sk_...`）
 
@@ -177,7 +181,7 @@ dsh plugin --profile web remove dsh-clinepass
 要锁版本就带上 tag（不带则取默认分支的最新提交）：
 
 ```sh
-dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1#v0.6.2
+dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1#v0.7.2
 ```
 
 > 这条路径要求 PATH 上有 `pnpm` —— `dsh plugin` 本身就是 pnpm 转发器。
@@ -467,7 +471,7 @@ reasoning、**两个 `bash` 工具调用**的完整参数，最后是 `usage` �
 | `UNSUPPORTED_REASONING_EFFORT` | 存的档位不在卡片声明的档位里（只有 `high` / `max`）。插件启动时会把默认模型的那个值对齐（`xhigh` → `max`，其它 → `high`）；**若某个已存会话仍报错**，在输入框的档位选择里重选一次即可 |
 | `MISSING_CREDENTIAL` | 还没在设置页填 key，或填到了别的引用名 |
 | 启动日志说 `"listen" is no longer used` | 旧配置里还留着已删除的反代选项；删掉那个字段即可（不影响运行） |
-| 严格钉选的代价 | `fallbacksAvailable: []` 意味着 deepseek 渠道不可用时请求直接失败、**不会回退** —— 这是「钉死」的语义 |
+| 严格钉选的代价 | 网关自 2026-09-22 起忽略 `only`，所以 `fallbacksAvailable` 里列出另外 15 个渠道是**正常现象**，不代表钉选失效。真正的「钉死」由本地闸兑现：不是允许渠道提供的响应会被拦下。代价是偶发的一次整轮作废 —— 内容已经显示过，但进不了上下文、工具也不会执行（见上面的「钉选现在由本地兑现」） |
 
 ## 安全说明
 
@@ -518,9 +522,9 @@ node uninstall.mjs --keep-provider  # 保留设置页那张卡片
 
 **Architecture.** The route is an ordinary **pi-ai provider profile** (`llm-pi-ai.providers.cline-pass`, OpenAI-compatible, key from the credential store) — which is exactly why dsh renders a native provider card with a key field for it. The plugin only adds `providerOptions.gateway.only` to outgoing requests, leaving streaming, tool calls, reasoning, usage and images on pi-ai's proven path. The pin is injected **in-process**: the plugin wraps `globalThis.fetch` for the life of the process and rewrites **only** this gateway's chat-completions bodies — **no listener, no port, nothing to configure for transport**. (0.5.0 removed the optional loopback reverse proxy; a config still naming `transport` / `listen` / `captureDir` is reported once and ignored.) Only requests to the configured `upstream` origin are ever touched, and unrelated calls are passed through as the exact same arguments. On start the plugin also **provisions** the profile (repairing only a recognisably-own stale address, never overwriting a foreign one) and aligns an unsupported stored reasoning level. Since 0.6.2 it also keeps the gateway's `type/` prefix out of the **prompt**: a prepended `system-prompt/assemble` listener rewrites the `{{model}}` reference in the two persona sections, so the persona reads `deepseek-v4.1-flash` while the wire, the session records and the model picker keep `cline-pass/deepseek-v4.1-flash` (`plainModelId: false` turns this off). Since **0.7.0** the Cline Pass card on Settings → Models also shows **usage**: the 5-hour, weekly and monthly windows as progress bars of what is **left**, with the remaining percent, the reset countdown and the read time (the gateway only reports `percentUsed`, so remaining is `100 − percentUsed`, computed in the browser half and rounded to one decimal so `100 − 82.4` cannot print `17.599999999999994`). `client.js` is the browser half — a hand-written bundle (no build step, like `dsh-notify-ping`) that registers into dsh's documented `settings.models.provider-card` slot; the **host** half reads `GET https://api.cline.bot/api/v1/users/me/plan/usage-limits` with the stored key and publishes only the resulting numbers at `/api/clinepass.usage`, an exact Fetch route on the HTTP server dsh **already runs** — a new *path*, still no listener of ours. The browser cannot read the key by design (dsh's credential seam is write-only), which is exactly why the card needs a host half.
 
-**Install.** `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1` — the package declares `dsh.bundle.patch`, so `dsh plugin` (a pnpm forwarder) installs it and appends it to `dsh.profile.bundles` on its own: no clone, no hand-edited patch. Append `#v0.7.0` to pin a tag. Without pnpm, `node install.mjs` copies the plugin into the profile and appends the loader row instead (idempotent + backed up) — use one route or the other, never both. Restart dsh either way, then set the key on Settings → Models. Configuration defaults are complete — `upstream`, `pin`, `pins`, `provider`, `model`, `apiKeyEnv`, `provision`, `alignReasoningEffort`, `plainModelId`, `usage`, `usageRoute`, `usageTimeoutMs`, `usageCacheMs`, `statusFile`. **No third-party dependencies**: the host half imports only Node built-ins and the browser half only asks for React from the shell's static module table.
+**Install.** `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1` — the package declares `dsh.bundle.patch`, so `dsh plugin` (a pnpm forwarder) installs it and appends it to `dsh.profile.bundles` on its own: no clone, no hand-edited patch. Append `#v0.7.2` to pin a tag. Without pnpm, `node install.mjs` copies the plugin into the profile and appends the loader row instead (idempotent + backed up) — use one route or the other, never both. Restart dsh either way, then set the key on Settings → Models. Configuration defaults are complete — `upstream`, `pin`, `pins`, `provider`, `model`, `apiKeyEnv`, `provision`, `alignReasoningEffort`, `plainModelId`, `usage`, `usageRoute`, `usageTimeoutMs`, `usageCacheMs`, `statusFile`. **No third-party dependencies**: the host half imports only Node built-ins and the browser half only asks for React from the shell's static module table.
 
-**Verify.** `cat ~/.dsh/dsh-clinepass-status.json` — the running dsh writes its hook state and counters there (`hook: installed`, `seen`/`pinned`/`skipped`, last pin), which is how a silently bypassed hook becomes visible; `node test-package.mjs` (packaging invariants: the bundle declaration is installable, no lifecycle scripts, the bundle and installer rows cannot drift, and the client-half declaration is loadable), `node test-fetch.mjs` (URL scoping, pass-through fidelity, install/uninstall and reload semantics, body shapes, robustness, status file, integration through the real fetch), `node test-settings.mjs` (the option surface, provisioning and the effort migration), `node test-usage.mjs` (response narrowing, the gateway read, the route handler's caching/dedupe/failure classification and key containment, the `apply` wiring), `node test-install.mjs` (install/uninstall round trips), `node smoke-test.mjs [--negative]` (checks the live process's status file, then runs a real gateway round trip asserting `finalProvider: "deepseek"` and no fallbacks). To check the usage half against the live process, open the page with its token and GET `/api/clinepass.usage` — it should answer `{"ok":true,"limits":[…]}`.
+**Verify.** `cat ~/.dsh/dsh-clinepass-status.json` — the running dsh writes its hook state and counters there (`hook: installed`, `seen`/`pinned`/`skipped`, last pin), which is how a silently bypassed hook becomes visible; `node test-package.mjs` (packaging invariants: the bundle declaration is installable, no lifecycle scripts, the bundle and installer rows cannot drift, and the client-half declaration is loadable), `node test-fetch.mjs` (URL scoping, pass-through fidelity, install/uninstall and reload semantics, body shapes, robustness, status file, integration through the real fetch), `node test-settings.mjs` (the option surface, provisioning and the effort migration), `node test-usage.mjs` (response narrowing, the gateway read, the route handler's caching/dedupe/failure classification and key containment, the `apply` wiring), `node test-install.mjs` (install/uninstall round trips), `node smoke-test.mjs [--negative]` (checks the live process's status file, then runs a real gateway round trip asserting `finalProvider: "deepseek"` and that the local gate accepted the response). To check the usage half against the live process, open the page with its token and GET `/api/clinepass.usage` — it should answer `{"ok":true,"limits":[…]}`.
 
 **Uninstall.** Bundle install: run `uninstall.mjs` from the installed package (`node <profile>/node_modules/dsh-clinepass/uninstall.mjs` — it drops the provisioned provider profile), then `dsh plugin --profile web remove dsh-clinepass`. Installer install: `node uninstall.mjs [--keep-provider]`. Restart dsh afterwards.
 

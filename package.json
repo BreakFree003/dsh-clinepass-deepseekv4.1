@@ -26,6 +26,7 @@
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
+    "RELEASING.md",
     "patch-file.mjs"
   ],
   "scripts": {

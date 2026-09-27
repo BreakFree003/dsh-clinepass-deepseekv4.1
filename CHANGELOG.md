@@ -168,11 +168,11 @@ a channel that cannot exist (`__no_such_upstream__`) and not pinning at all
 produce **byte-identical** `routing` metadata — same `finalProvider: "deepseek"`,
 same `fallbacksAvailable` listing all 15 other channels, same
 `planningReasoning` ("System credentials planned for: deepseek, alibaba, …
-Total execution order: deepseek(system) → alibaba(system) → …"). Nine spellings
-of the pin (`order`, `models`, `sort`, a top-level `only`, `providerOptions.only`,
-snake_case, …) were tried and all were ignored. The request field is still sent —
-it costs nothing and works again the day the gateway restores it — but it no
-longer decides anything.
+Total execution order: deepseek(system) → alibaba(system) → …"). Every spelling
+of the pin we tried (`order`, `models`, `sort`, a top-level `only`,
+`providerOptions.only`, snake_case, …) was ignored. The request field is still
+sent — it costs nothing and works again the day the gateway restores it — but it
+no longer decides anything.
 
 Added:
 
