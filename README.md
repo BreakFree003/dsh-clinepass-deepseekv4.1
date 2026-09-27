@@ -399,6 +399,59 @@ undici、但只连 `127.0.0.1`；`test-usage.mjs` 连那个都不需要 —— �
 
 `provision` 字段说明 provider 卡片的登记结果：`created`（新建）/ `present`（已存在）/ `repaired`（地址过期已修正）/ `mismatch`（那张卡片不是本插件建的，未改动；请求会绕过钉选，需要你手动改地址）/ `failed`（settings 写入失败，日志里会有原因）。
 
+## 实战记录：一次真实的拦截（2026-09-28）
+
+第一份**线上**样本（不是测试）：0.7.2 的流式闸在真网关、真会话里拦下了一条由
+`alibaba` 提供的响应，并且是在工具执行**之前**拦下的。环境是 dsh 0.1.7-rc.2 +
+本插件 0.7.2，配置为 `pin: [deepseek]`、`enforcement: strict`。证据是同一台机器上
+两处互不相干的记录。
+
+**一、正在运行的 dsh 写的状态文件**（`~/.dsh/dsh-clinepass-status.json`；`pid` 与
+当时的 `dsh web` 进程一致）：
+
+```json
+"counters": { "seen": 696, "pinned": 696, "skipped": 0, "blocked": 1, "unverified": 0 },
+"enforcement": "strict",
+"lastViolation": {
+  "at": "2026-09-27T21:51:44.865Z",
+  "allowed": ["deepseek"],
+  "reason": "finalProvider=alibaba，允许的是 deepseek",
+  "finalProvider": "alibaba",
+  "fallbacksAvailable": ["alibaba", "baseten", "fireworks", "runware", "relace",
+                         "particle", "novita", "togetherai", "deepinfra", "wafer",
+                         "parasail", "gmicloud", "modal", "morph", "boundless"]
+},
+"lastVerified": { "at": "2026-09-27T22:02:01.405Z", "provider": "deepseek", "attempts": 1 }
+```
+
+`seen` 与 `pinned` 相等（696/696）说明这段时间里每个落到本网关的 chat 请求都注入了
+钉选；`blocked: 1` 是这唯一一条违规；`unverified: 0` 说明**没有**流是「没来得及裁决」的
+—— 这一条是判出来的，不是猜的，也不是取消留下的噪声。
+
+**二、同一轮的会话日志**（dsh 的 `session.v4.jsonl`）：`turn/end` 落在
+`2026-09-27T21:51:44.879Z` —— 比裁决落盘晚 **14 ms** —— 文案正是流式路径那条固定文案：
+
+> cline-pass 渠道校验未通过：响应不是由允许的渠道提供……这次调用已作废：内容没有进入模型
+> 上下文、工具也不会执行（可能已在窗口里闪现）。enforcement=strict；想只告警就设
+> enforcement: "warn"。
+
+这一步（step 6）在会话里只留下一条 `assistant/attempt`：它的流里已经有 517 字的
+reasoning、**两个 `bash` 工具调用**的完整参数，最后是 `usage` 与 `finish` 两帧 —— 而
+`[DONE]` 那一帧从未到达消费者（它在闸手里）。然后就报了上面那个错。整轮**没有**
+`assistant/message`，也**没有** `tool/result`：那两个 bash 一次都没跑。10 分 17 秒之后的
+下一次调用（22:02:01Z）`lastVerified` 又记到 `provider: deepseek` —— 所以这是一次**间歇性
+回退**，不是渠道被整体换掉。
+
+这份样本确认了三件事：闸在线上会拒；拒发生在工具执行之前；`unverified` 全程为 0，即没有
+误判成违规。它**不**确认的也要写清：
+
+- **n = 1**。它证明闸会拒，不证明网关的回退频率；`blocked / seen` = 1/696 只描述这段时间。
+- **代价也真实发生了**：那条响应的内容 —— 连那两个工具调用的参数 —— 在裁决之前已经流进
+  窗口。这就是 0.7.2 用「扣住终止帧」换流式时写下的代价，`assistant/attempt` 里留下的
+  reasoning / tool-call 帧是它的实证，不是推测。
+- **裁决依据仍是网关自报的 `routing`**（`finalProvider`）。这一条没有被改变：说谎的网关
+  仍然骗得过它（见上面「钉选现在由本地兑现」一节里的边界）。
+
 ## 常见问题
 
 | 现象 | 原因 / 处理 |

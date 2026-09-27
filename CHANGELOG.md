@@ -144,6 +144,19 @@ Known limits (measured, not hypothetical — these are documented in the README)
   marks an attempt that streamed bytes and then failed is unknown (not
   reproducible offline); if it does, the rule must be tightened.
 
+Observed in the field, not in a test (README: 实战记录): a live 0.7.2 install
+(dsh 0.1.7-rc.2, `pin: [deepseek]`, `enforcement: strict`) recorded
+`blocked: 1` against `seen: 696` / `pinned: 696` / `unverified: 0`, with
+`lastViolation.finalProvider: "alibaba"` and 15 fallbacks listed — a real
+intermittent fallback, since the next call 10m17s later verified as
+`deepseek` again. The round that hit it is the first production sample of the
+cost this release documents: its only product was an `assistant/attempt` whose
+stream already carried 517 characters of reasoning and two complete `bash` tool
+calls, and it failed 14 ms after the verdict was written — no
+`assistant/message`, no `tool/result`, neither tool executed. `unverified`
+staying 0 is the other half of the claim: the block was a verdict rather than a
+stream that was never judged.
+
 ## 0.7.1
 
 **The gateway stopped honouring `providerOptions.gateway.only`, so the pin is now
