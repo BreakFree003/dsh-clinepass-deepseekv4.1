@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.8
+
+Documentation only — `index.js` is byte-for-byte the file 0.7.7 shipped.
+
+- 0.7.7 said the automatic registration cannot work on dsh 0.1.7 and that the
+  installer should write the provider row by hand. This adds the other half of
+  that answer for whoever wants to fix the plugin instead: provisioning has to
+  happen inside `ctx.inject(['settings'], …)` so it waits for the service, with
+  the hook still installed immediately — the shape a probe verified. It also notes
+  that `provision: null` currently means both "not yet" and "never ran", which a
+  real fix would separate.
+
 ## 0.7.7
 
 Documentation only — `index.js` is byte-for-byte the file 0.7.6 shipped (compared
