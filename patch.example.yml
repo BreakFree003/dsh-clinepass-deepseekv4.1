@@ -1,5 +1,10 @@
 # The one entry dsh-clinepass needs in a profile's cordis.patch.yml.
 #
+# On dsh 0.1.7 the plugin's own provider registration does not run at a cold
+# start, so a second entry is required as well — the `llm-pi-ai` provider block
+# in the README section 「在 dsh 0.1.7 上：这一行要自己写」. Without it the model
+# picker has no Cline Pass entry, and `provision` stays null in the status file.
+#
 # `upstream` and `pin` have working defaults (https://api.cline.bot,
 # ["deepseek"]), so mounting the row is enough. install.mjs appends this block
 # for you.

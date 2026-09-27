@@ -154,9 +154,12 @@ surface op，不进上下文），绝不会装配 `assistant/message`，于是�
 ## 环境要求
 
 - dsh：实测过 `0.1.6-alpha.1`（本插件主要是在它上面开发与验证的）和 `0.1.7-rc.2`（下面
-  「实战记录」那一节所在的机器跑的就是它）。**0.1.7 改了 settings 服务的接口**：`get()` 没有了，
-  值要经 `describe()` 读 —— **0.7.4 及更早在这上面登记不了 provider 卡片**（`provision: "failed"`，
-  原因 `settings.get is not a function`），0.7.5 起已适配。注意 npm 上**没有** `0.1.5` 这个版本，只有
+  「实战记录」那一节所在的机器跑的就是它）。**0.1.7 与这个插件的自动登记不兼容，两条独立的原因**：
+  (1) settings 服务的 `get()` 被移除，值要经 `describe()` 读 —— 0.7.4 及更早会抛
+  `settings.get is not a function`（状态文件里 `provision: "failed"` + 原因），0.7.5 起已适配；
+  (2) **冷启动时 settings 服务还没注册**，插件读 `ctx.settings` 会抛 `cannot get property "settings"
+  without inject`，登记**根本不会开始**（`provision: null`）—— 这一条**没有修**，要自己把 provider
+  行写进 patch，见上面「在 dsh 0.1.7 上：这一行要自己写」。注意 npm 上**没有** `0.1.5` 这个版本，只有
   `0.1.5-alpha.*` / `0.1.5-rc.*`；`dsh plugin` 与 `dsh.bundle` 相关的模块从 `0.1.2-alpha.3`
   的包里就已存在，但那些更早的版本没有实测过，不保证。
 - Node.js ≥ 20
@@ -184,7 +187,7 @@ dsh plugin --profile web remove dsh-clinepass
 要锁版本就带上 tag（不带则取默认分支的最新提交）：
 
 ```sh
-dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1#v0.7.6
+dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1#v0.7.7
 ```
 
 > 这条路径要求 PATH 上有 `pnpm` —— `dsh plugin` 本身就是 pnpm 转发器。
@@ -238,24 +241,70 @@ node install.mjs --dry-run                     # 只看会改什么
 ### 然后
 
 1. **重启 dsh**（profile 只在启动时读取）：终端里 `Ctrl-C`，再 `dsh web`。
-2. 打开 **设置 → 模型**，会出现一张 **Cline Pass** 卡片（插件启动时自动登记）。把 API key 粘进去、保存。
-3. 在模型选择器里选 **Cline Pass / DeepSeek V4.1 Flash**。
+2. **在 dsh 0.1.7 上，再自己写一次 provider 行**（见下一节 —— 这个版本上插件不会自动登记）。
+3. 打开 **设置 → 模型**：应当能看到一张 **Cline Pass** 卡片。把 API key 粘进去、保存。
+4. 在模型选择器里选 **Cline Pass / DeepSeek V4.1 Flash**。
 
-> **卡片没出现怎么办。** 先 `cat ~/.dsh/dsh-clinepass-status.json` 看 `provision`：`failed` / `unavailable` 就是原因。
-> 如果它是 `created` 而设置页里仍然没有那张卡片，就**手写一份**：把 `patch.example.yml`（或本仓库 README 上面
-> 「方式 C」那段）里的 `llm-pi-ai.providers['cline-pass']` 贴进 profile 的 `cordis.patch.yml`。这不是理论情况 ——
-> 本插件的开发机就是这么部署的：dsh 0.1.7 上「插件登记不了卡片、模型选择器里只剩一个失效条目」，最后靠手写
-> 这一段解决，并且一直留着。**真因已经查明**：dsh 0.1.7 移除了 settings 的 `get()`，0.7.4 及更早会抛
-> `settings.get is not a function`（状态文件里就是 `provision: "failed"` + 那条 `provisionReason`），
-> **0.7.5 起已修复**；还在 0.7.4 及更早的话，手写这一段仍然是最省事的办法。
+### 在 dsh 0.1.7 上：这一行要自己写
 
-想让它成为默认模型，在 `~/.dsh/settings.yaml` 里加：
+**这不是「出问题时的兜底」，是安装步骤的一部分。** 插件本来会在启动时把
+`llm-pi-ai.providers['cline-pass']` 登记进去；在 dsh 0.1.7 上，**冷启动根本走不到那一步** ——
+干净 `DSH_HOME` 里的探针插件实测：
+
+```
+{"step":"ctx.settings-threw","message":"cannot get property \"settings\" without inject"}
+{"step":"ctx.get-loose","found":false}
+```
+
+插件读的是 `ctx.settings`，而那一刻 settings 服务**还没注册**；cordis 的规矩是插件得先用
+`inject` 声明依赖才会被等待，本插件没有声明 —— 于是 `apply()` 在那一行当场中断，后面的登记
+一步都没跑。（热重载时不会这样：服务早就起来了。所以它只在**新装 / 冷启动**时露出来。
+0.1.6 时代实测过自动登记是好的；差异来自 dsh 的服务时序，没有逐版本定位。）
+
+**怎么认出来**：`hook: installed` 正常，但状态文件里 `provision` 是 **`null`**（不是
+`failed`）—— `null` 就是「登记这一步根本没跑」的签名，设置页里也没有 Cline Pass 卡片。
+
+**处理**：把下面这段贴进 `<DSH_HOME>/profiles/<profile>/cordis.patch.yml`，再重启 dsh。
+（那个文件是个 YAML 数组；里面只有 `[]` 时，整个换成下面这段。）值取自插件的默认配置 ——
+地址、协议、key 的存放名、模型 id、两个档位都对得上，所以插件随后能认出这张卡。
 
 ```yaml
-agent-default-model:
-  provider: cline-pass
-  model: cline-pass/deepseek-v4.1-flash
-  reasoningEffort: high
+- id: llm-pi-ai
+  config:
+    providers:
+      cline-pass:
+        displayName: Cline Pass
+        api: openai-completions
+        apiKeyEnv: CLINE_PASS_API_KEY
+        baseURL: https://api.cline.bot/api/v1
+        models:
+          - id: cline-pass/deepseek-v4.1-flash
+            name: DeepSeek V4.1 Flash
+            contextWindow: 921600
+            maxTokens: 131072
+            input: [text, image]
+            reasoningEfforts:
+              high: high
+              max: max
+```
+
+**API key 照旧在设置页里粘**：上面的 `apiKeyEnv` 只是 key 的存放名，不是 key 本身。
+
+> **同一版本上另一个坑（dsh 侧，没定性）**：干净 profile 里实测 settings 写入会卡在
+> `atomic-write: timed out waiting for the writer lock at <profile>/package.json.lock` ——
+> 锁文件里写着 dsh 自己的 pid，进程空闲，之后的重试不是报错而是一直挂着。它和本插件无关，
+> 但在这种 profile 上**设置页保存也会失败**。撞上了就停掉 dsh、删掉那个 `.lock`、再起；
+> 不要在 dsh 还活着的时候删，那个锁属于它。本插件的开发机（老 profile）上没有这个文件。
+
+想让它成为默认模型，**dsh 0.1.7 上**是在同一个 profile patch 里加一行（0.1.6 及更早才是
+`~/.dsh/settings.yaml` 里那个 `agent-default-model:` 段）：
+
+```yaml
+- id: agent-default-model
+  config:
+    provider: cline-pass
+    model: cline-pass/deepseek-v4.1-flash
+    reasoningEffort: high
 ```
 
 > 档位只有两个：`high`（线上 `reasoning_effort: "high"`）和 `max`（线上 `"max"`）。`max` 就是 pi-ai 升级顺序里的最高档，profile 里可以直接声明它，不需要别名。
@@ -422,7 +471,9 @@ undici、但只连 `127.0.0.1`；`test-usage.mjs` 连那个都不需要 —— �
 `provision` 记的是 provider 卡片的登记结果：`created`（新建）/ `present`（已存在）/ `repaired`（地址过期已修正）
 / `mismatch`（那张卡片不是本插件建的，未改动；请求会绕过钉选，需要你手动改地址）/ `failed`（settings 写入失败）/
 `off`（`provision: false`）/ `unavailable`（拿不到 settings 服务）。**`failed` / `mismatch` / `repaired` 时，`provisionReason`
-里就是那句话**（`present` / `created` 时为 `null`）—— 它和日志行同源，但一定落盘。`provision` 在**三个地方**都能看到：
+里就是那句话**（`present` / `created` 时为 `null`）—— 它和日志行同源，但一定落盘。**登记压根没跑时
+`provision` 是 `null`**（dsh 0.1.7 冷启动就是这样，见上面那一节）：`null` ≠ `present`，这个区别就是
+「跑没跑」。`provision` 在**三个地方**都能看到：
 状态文件、插件启动日志那一行（`… pin deepseek (profile present); prompt shows …`）、以及 `smoke-test.mjs` 读到的内存态。
 
 **关于日志。** 插件把请求、拦截、登记结果打成 dsh 的插件日志（`ctx.logger`）—— 但**这份 composition 里没有
@@ -490,7 +541,7 @@ reasoning、**两个 `bash` 工具调用**的完整参数，最后是 `usage` �
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| 设置 → 模型里没有 Cline Pass 卡片 | 先看状态文件的 `provision`（`failed` / `unavailable` 就是原因）与 `hook`（要 `installed`）；`created` 却仍然没卡片时，按 `patch.example.yml` 把 `llm-pi-ai.providers['cline-pass']` 手写进 profile 的 `cordis.patch.yml` —— 见上面「卡片没出现怎么办」 |
+| 设置 → 模型里没有 Cline Pass 卡片 | **dsh 0.1.7 上先按「在 dsh 0.1.7 上：这一行要自己写」把 `llm-pi-ai` 行写进 profile patch**（这个版本上插件不会自动登记，状态文件里 `provision` 是 `null`）；写完之后还没有那张卡片，再看 `provision` 的具体值与 `hook`（要 `installed`） |
 | 卡片里 API 地址不是 `https://api.cline.bot/api/v1` | 那张卡片不是本插件建的（`provision: mismatch`），插件不去改它。改成网关地址，否则请求绕过钉选 |
 | 状态文件里 `hook: unavailable` | 有别的插件先替换了 `globalThis.fetch`。找出是哪个插件；现在没有备用 transport，钩子装不进去时请求会不带钉选 |
 | 状态文件里 `hook: foreign` | 装好之后全局 fetch 被别的代码换掉了（插件每 30 秒自查）。换掉之后的请求不再被钉，排查是哪个插件 |
@@ -533,6 +584,8 @@ dsh plugin --profile web remove dsh-clinepass
 
 第 1 步会顺带报「没找到 `clinepass` 行」「插件目录已不存在」——bundle 布局下这两件事本来
 就无事可做，它真正干活的是删掉 `settings.yaml` 里的 `llm-pi-ai.providers.cline-pass`。
+**dsh 0.1.7 上的那张卡片通常是你手写进 profile 的 `cordis.patch.yml` 的**：上面两步跑完回头看一眼，
+还在就自己删掉 `- id: llm-pi-ai` 那一行（或只删它 `providers` 里的 `cline-pass:` 段）。
 想留着那张卡片就加 `--keep-provider`。
 
 **方式 B（安装器）装的：**
@@ -552,7 +605,7 @@ node uninstall.mjs --keep-provider  # 保留设置页那张卡片
 
 **Architecture.** The route is an ordinary **pi-ai provider profile** (`llm-pi-ai.providers.cline-pass`, OpenAI-compatible, key from the credential store) — which is exactly why dsh renders a native provider card with a key field for it. The plugin only adds `providerOptions.gateway.only` to outgoing requests, leaving streaming, tool calls, reasoning, usage and images on pi-ai's proven path. The pin is injected **in-process**: the plugin wraps `globalThis.fetch` for the life of the process and rewrites **only** this gateway's chat-completions bodies — **no listener, no port, nothing to configure for transport**. (0.5.0 removed the optional loopback reverse proxy; a config still naming `transport` / `listen` / `captureDir` is reported once and ignored.) Only requests to the configured `upstream` origin are ever touched, and unrelated calls are passed through as the exact same arguments. On start the plugin also **provisions** the profile (repairing only a recognisably-own stale address, never overwriting a foreign one) and aligns an unsupported stored reasoning level. Since 0.6.2 it also keeps the gateway's `type/` prefix out of the **prompt**: a prepended `system-prompt/assemble` listener rewrites the `{{model}}` reference in the two persona sections, so the persona reads `deepseek-v4.1-flash` while the wire, the session records and the model picker keep `cline-pass/deepseek-v4.1-flash` (`plainModelId: false` turns this off). Since **0.7.0** the Cline Pass card on Settings → Models also shows **usage**: the 5-hour, weekly and monthly windows as progress bars of what is **left**, with the remaining percent, the reset countdown and the read time (the gateway only reports `percentUsed`, so remaining is `100 − percentUsed`, computed in the browser half and rounded to one decimal so `100 − 82.4` cannot print `17.599999999999994`). `client.js` is the browser half — a hand-written bundle (no build step, like `dsh-notify-ping`) that registers into dsh's documented `settings.models.provider-card` slot; the **host** half reads `GET https://api.cline.bot/api/v1/users/me/plan/usage-limits` with the stored key and publishes only the resulting numbers at `/api/clinepass.usage`, an exact Fetch route on the HTTP server dsh **already runs** — a new *path*, still no listener of ours. The browser cannot read the key by design (dsh's credential seam is write-only), which is exactly why the card needs a host half.
 
-**Install.** `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1` — the package declares `dsh.bundle.patch`, so `dsh plugin` (a pnpm forwarder) installs it and appends it to `dsh.profile.bundles` on its own: no clone, no hand-edited patch. Append `#v0.7.6` to pin a tag. Without pnpm, `node install.mjs` copies the plugin into the profile and appends the loader row instead (idempotent + backed up) — use one route or the other, never both. Restart dsh either way, then set the key on Settings → Models. Configuration defaults are complete — `upstream`, `pin`, `pins`, `provider`, `model`, `apiKeyEnv`, `provision`, `alignReasoningEffort`, `plainModelId`, `usage`, `usageRoute`, `usageTimeoutMs`, `usageCacheMs`, `statusFile`. **No third-party dependencies**: the host half imports only Node built-ins and the browser half only asks for React from the shell's static module table.
+**Install.** `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1` — the package declares `dsh.bundle.patch`, so `dsh plugin` (a pnpm forwarder) installs it and appends it to `dsh.profile.bundles` on its own: no clone, no hand-edited patch. Append `#v0.7.7` to pin a tag. Without pnpm, `node install.mjs` copies the plugin into the profile and appends the loader row instead (idempotent + backed up) — use one route or the other, never both. Restart dsh either way, then set the key on Settings → Models. Configuration defaults are complete — `upstream`, `pin`, `pins`, `provider`, `model`, `apiKeyEnv`, `provision`, `alignReasoningEffort`, `plainModelId`, `usage`, `usageRoute`, `usageTimeoutMs`, `usageCacheMs`, `statusFile`. **No third-party dependencies**: the host half imports only Node built-ins and the browser half only asks for React from the shell's static module table.
 
 **Verify.** `cat ~/.dsh/dsh-clinepass-status.json` — the running dsh writes its hook state and counters there (`hook`, `provision`, `seen`/`pinned`/`skipped`, `lastSkipped`, `lastVerified`/`lastViolation`), which is how a silently bypassed hook becomes visible — and that file, not the log, is what to rely on: whether this plugin's `ctx.logger` lines reach a file at all depends on how the host was started (on the development machine, other plugins that print via `console` land in the launchd log while these do not); `node test-package.mjs` (packaging invariants: the bundle declaration is installable, no lifecycle scripts, the bundle and installer rows cannot drift, and the client-half declaration is loadable), `node test-fetch.mjs` (URL scoping, pass-through fidelity, install/uninstall and reload semantics, body shapes, robustness, status file, integration through the real fetch), `node test-settings.mjs` (the option surface, provisioning and the effort migration), `node test-usage.mjs` (response narrowing, the gateway read, the route handler's caching/dedupe/failure classification and key containment, the `apply` wiring), `node test-install.mjs` (install/uninstall round trips), `node smoke-test.mjs [--negative]` (checks the live process's status file, then runs a real gateway round trip asserting `finalProvider: "deepseek"` and that the local gate accepted the response). To check the usage half against the live process, open the page with its token and GET `/api/clinepass.usage` — it should answer `{"ok":true,"limits":[…]}`.
 

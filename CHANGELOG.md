@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.7.7
+
+Documentation only — `index.js` is byte-for-byte the file 0.7.6 shipped (compared
+against the previous tag, per RELEASING.md step 6).
+
+0.7.5 claimed dsh 0.1.7 had broken provider registration and that fixing the
+`settings.get()` call fixed it. The second half was wrong, and a clean room said
+so within the hour: **on a cold start the plugin never gets as far as registering
+anything.**
+
+A fresh `DSH_HOME` — profile auto-created from the shipped web template, plugin
+installed with the documented `dsh plugin … add` command — booted with
+`hook: installed` and `provision: null`, the null being the signature of a step
+that never ran. A probe plugin wrote the reason to a file, because `ctx.logger`
+lines land nowhere:
+
+    {"step":"ctx.settings-threw","message":"cannot get property \"settings\" without inject"}
+    {"step":"ctx.get-loose","found":false}
+
+The plugin reads `ctx.settings` while the settings service is not registered yet.
+cordis waits for a dependency only when the plugin declares one with `inject`, and
+this plugin declares none, so `apply()` throws on that line — registration, the
+stored-effort migration, and everything after it never execute. A hot reload never
+shows it (the service came up long ago), which is why the development machine
+looked fine, and why the「0.1.7 上它没写成功」note in that machine's profile patch
+was in fact this.
+
+**This release does not fix it.** A standalone plugin whose install is already one
+command plus one manual provider row does not get to grow a service-timing
+workaround; the honest move is to write the requirement where the installer will
+read it:
+
+- The install section now has the provider row as **step 2 of 4**, not as a
+  fallback, with the complete `llm-pi-ai` block to paste, the probe evidence, and
+  the two signatures that tell the cases apart — `provision: null` means the
+  registration never ran, `failed` plus `provisionReason` means it ran and failed.
+- The stale half of the old advice is gone: on 0.1.7 the default model is a profile
+  patch row (`- id: agent-default-model`), not a `~/.dsh/settings.yaml` section,
+  which no longer exists; the uninstall steps say what to delete by hand.
+- `patch.example.yml` points at the second entry, so 方式 A / B / C all reach it.
+- A second, **dsh-side** observation is recorded rather than hidden: in the same
+  clean room a settings write died with `atomic-write: timed out waiting for the
+  writer lock at <profile>/package.json.lock` (the lock naming the dsh's own pid,
+  with the process idle) and later attempts hung instead of failing. Not diagnosed
+  — it could be 0.1.7-rc.2, a startup-window race with the profile manager, or that
+  throwaway profile. The development machine's profile has no such file. Recorded
+  because on such a profile saving in Settings → Models fails too, and that is not
+  this plugin's doing.
+
 ## 0.7.6
 
 Documentation only — `index.js` is byte-for-byte the file 0.7.5 shipped (compared
@@ -59,6 +108,12 @@ Verified on the machine that found it: with this release mounted, the same statu
 file flips to `provision: "present"` / `provisionReason: null`, and
 `settings.yaml` is left untouched, because that deployment declares the card
 itself.
+
+**Correction (0.7.7):** this release fixed a real bug and then drew too broad a
+conclusion from it. `settings.get()` was indeed gone — but a cold start never
+reaches that call at all (`ctx.settings` throws without `inject` first), so "a
+fresh install got no card" was never this one cause. See 0.7.7 for what a new
+install actually needs.
 
 ## 0.7.4
 
