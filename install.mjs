@@ -103,6 +103,36 @@ const FETCH_BLOCK = `# ── dsh-clinepass ────────────
 
 const BLOCK = FETCH_BLOCK
 
+// The provider card, declared statically. The plugin can also register this at
+// run time, but on dsh 0.1.7 that write is not dependable: the settings service
+// is not registered at a cold start, and on a fresh profile the write waits on
+// the profile manifest's writer lock instead of failing. A patch row replaces
+// the whole `config` of the row it targets — so this is appended only when the
+// profile has no `llm-pi-ai` row of its own, because otherwise the user's row
+// (and every other provider in it) would be silently replaced.
+const PROVIDER_BLOCK = `# ── Cline Pass provider card ────────────────────────────────────────────────
+# Declared here rather than written at run time: on dsh 0.1.7 a plugin's settings
+# write is not dependable (see the README). A patch row replaces the whole config
+# of the row it targets, so keep the other providers you declare in here.
+- id: llm-pi-ai
+  config:
+    providers:
+      cline-pass:
+        displayName: Cline Pass
+        api: openai-completions
+        apiKeyEnv: CLINE_PASS_API_KEY
+        baseURL: https://api.cline.bot/api/v1
+        models:
+          - id: cline-pass/deepseek-v4.1-flash
+            name: DeepSeek V4.1 Flash
+            contextWindow: 921600
+            maxTokens: 131072
+            input: [text, image]
+            reasoningEfforts:
+              high: high
+              max: max
+`
+
 console.log(`dsh-clinepass installer
   DSH_HOME  : ${dshHome}
   profile   : ${profile}
@@ -184,6 +214,33 @@ if (has('no-patch')) {
         parsed.entries.push({ lines: ['', ...blockLines], text: ['', ...blockLines].join('\n') })
         console.log(`    backup: ${writeWithBackup(patchPath, rebuildPatch(parsed, eol))}`)
       }
+    }
+  }
+}
+
+// ── 3. declare the provider card ────────────────────────────────────────────
+// The card is data, not a write: `providers` is a `.volatile()` field of the
+// `llm-pi-ai` row, so declaring it is enough for Settings → Models to show the
+// card and for the model selector to list the route. The plugin can also
+// register this at run time, but not dependably on dsh 0.1.7 (see the README).
+//
+// Appended only when the profile has no `llm-pi-ai` row of its own: a patch row
+// replaces the whole `config` of the row it targets, so a second one would
+// silently drop every other provider declared there.
+if (has('no-patch')) {
+  console.log('  provider row skipped (--no-patch)')
+} else {
+  const parsed = parsePatch(fs.readFileSync(patchPath, 'utf8'))
+  const providerPattern = idPattern('llm-pi-ai')
+  if (parsed.entries.some((entry) => entry.lines.some((line) => providerPattern.test(line)))) {
+    console.log('  provider row: this profile already declares `llm-pi-ai` — left untouched')
+    console.log('    → put the `cline-pass:` provider in that row yourself (README 「在 dsh 0.1.7 上」)')
+  } else {
+    console.log(`  ${dryRun ? 'would append' : 'append'} the \`llm-pi-ai\` provider row (the Cline Pass card)`)
+    if (!dryRun) {
+      const lines = PROVIDER_BLOCK.replace(/\s*$/, '').split('\n')
+      parsed.entries.push({ lines: ['', ...lines], text: ['', ...lines].join('\n') })
+      console.log(`    backup: ${writeWithBackup(patchPath, rebuildPatch(parsed, parsed.eol))}`)
     }
   }
 }

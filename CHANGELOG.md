@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.8.0
+
+The Cline Pass card is now **declared by the package** instead of being written by
+the plugin at start-up: install it (either route), restart dsh, and Settings →
+Models has the card. No hand-written patch row, no run-time write.
+
+Why it had to change — a clean room showed both halves of the problem on 0.1.7:
+
+- A cold start reaches `apply()` before the settings service is registered. The
+  plugin used to read `ctx.settings` right there, which cordis refuses
+  (`cannot get property "settings" without inject`), so provisioning — and the
+  reasoning-effort migration behind it — never ran and `provision` stayed `null`,
+  which read the same as "not yet". Provisioning now publishes `pending` first,
+  waits for the service through `ctx.inject(['settings'], …)` instead of reading
+  it, and records `failed` plus a `provisionReason` when the call itself throws.
+  `test-fetch.mjs` gained a host double that refuses the property read and a
+  cold-boot case that fails on the previous code at that exact line
+  (`index.js:2091`, the line the error named in production).
+- The write is not dependable either: on a fresh profile it waits on the profile
+  manifest's writer lock rather than failing — the holder is dsh's own idle
+  process — so `provision` sat at `pending` and the patch file never changed. The
+  card therefore ships as data: `cordis.patch.yml` carries
+  `- id: llm-pi-ai / config.providers.cline-pass`, so a plain
+  `dsh plugin --profile web add …` is enough, and `install.mjs` appends the same
+  block for the offline routes. A fresh `DSH_HOME` installed that way composes the
+  card (`dsh web --dump-config`), boots with `provision: "present"`, leaves the
+  profile's own patch at `[]`, and creates no `.lock`.
+- A patch row replaces the whole `config` of the row it targets, so the installer
+  appends the block **only when the profile has no `llm-pi-ai` row of its own**;
+  it says why and points at the README instead of replacing a user's row (that row
+  is where their other providers live). `uninstall.mjs` removes only the block it
+  wrote, byte for byte.
+
+Docs: the install steps no longer ask for a hand-written provider row, and the
+README explains how the card is declared, why it rides on `llm-pi-ai` rather than
+a plugin-owned namespace (the Models page picks its layout by settings namespace),
+and what to do if you declare `llm-pi-ai` yourself. `npm test`: 582 assertions,
+five suites, all offline.
+
+Not a docs-only release: `index.js`, `install.mjs`, `uninstall.mjs` and
+`cordis.patch.yml` all changed.
+
 ## 0.7.8
 
 Documentation only — `index.js` is byte-for-byte the file 0.7.7 shipped.

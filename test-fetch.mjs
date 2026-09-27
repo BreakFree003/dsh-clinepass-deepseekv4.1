@@ -44,17 +44,52 @@ function recorder() {
  * the double records the event names it was asked to listen for — that is how a
  * thrown-away ctx would otherwise hide a registration.
  */
-function ctxFor(logger, settings, effect = () => {}) {
+function ctxFor(logger, settings, effect = () => {}, { deferSettings = false } = {}) {
   const listeners = new Map()
-  return {
+  const pending = []
+  const ctx = {
     logger,
-    settings,
     effect,
     listeners,
     on(event, listener, options) {
       listeners.set(event, { listener, options })
     },
+    // cordis: a service is reached through get()/inject(), and a bare property
+    // read of one the fiber never declared in `inject` throws. The double
+    // enforces both, so `ctx.settings` cannot quietly come back — that read is
+    // what aborted apply() on a cold boot (dsh 0.1.7).
+    // Only the `settings` seam is simulated here. It is reachable through
+    // get()/inject() and never as a property read — that is the cordis rule the
+    // cold-boot case is about; every other service reads as absent, as it does
+    // in this harness.
+    get(name, strict = true) {
+      if (name !== 'settings') return undefined
+      if (settings !== undefined && !deferSettings) return settings
+      if (strict) throw new Error(`cannot get property "${name}" without inject`)
+      return undefined
+    },
+    inject(names, callback) {
+      if (names.includes('settings') && settings !== undefined && deferSettings) pending.push({ names, run: () => callback({ ...ctx, settings }) })
+      else if (names.includes('settings') && settings !== undefined) callback({ ...ctx, settings })
+      return Promise.resolve()
+    },
+    /** Service names an injection is currently waiting on. */
+    queued() {
+      return pending.flatMap((entry) => entry.names)
+    },
+    /** Fire the injections cordis has not been able to run yet. */
+    deliver() {
+      const queued = pending.splice(0)
+      for (const entry of queued) entry.run()
+      return queued.length
+    },
   }
+  Object.defineProperty(ctx, 'settings', {
+    get() {
+      throw new Error('cannot get property "settings" without inject')
+    },
+  })
+  return ctx
 }
 
 const GATEWAY = 'https://api.cline.bot'
@@ -845,6 +880,29 @@ console.log('\n── 10. apply() ───────────────�
   check('plainModelId: false registers no prompt listener', !displayOffCtx.listeners.has('system-prompt/assemble'), JSON.stringify([...displayOffCtx.listeners.keys()]))
   check('…and the boot line says the configured id is what shows', displayOff.lines.info.some((line) => line.includes('prompt shows the configured model id')), JSON.stringify(displayOff.lines.info))
   displayOffDisposer()
+
+  // A cold boot: the settings service was not registered yet. Reading
+  // `ctx.settings` here used to throw (`cannot get property "settings" without
+  // inject`) and abort apply() before provisioning ran — the state file then
+  // said `provision: null` and no provider card ever appeared. The double above
+  // refuses that property read outright, so this case cannot regress silently.
+  const coldStatus = path.join(SCRATCH, 'cold-boot-status.json')
+  const coldLogs = recorder()
+  const coldSettings = makeSettings({ providers: {} })
+  let coldDisposer
+  const coldCtx = ctxFor(coldLogs, coldSettings, (register) => { coldDisposer = register() }, { deferSettings: true })
+  await apply(coldCtx, { statusFile: coldStatus })
+  const coldRead = () => JSON.parse(fs.readFileSync(coldStatus, 'utf8'))
+  check('a cold boot survives a settings service that is not registered yet', coldRead().provision === 'pending', JSON.stringify(coldRead().provision))
+  check('…writes nothing yet', coldSettings.writes.length === 0, JSON.stringify(coldSettings.writes))
+  check('…and says it will provision when the service registers', coldLogs.lines.info.some((line) => line.includes('when it registers')), JSON.stringify(coldLogs.lines.info))
+  check('the injection waits on the settings service by name', coldCtx.queued().includes('settings'), JSON.stringify(coldCtx.queued()))
+  const delivered = coldCtx.deliver()
+  for (let tick = 0; tick < 20 && coldRead().provision === 'pending'; tick += 1) await new Promise((resolve) => setImmediate(resolve))
+  check('delivering the settings service runs the registration', delivered === 1 && coldRead().provision === 'created', `${delivered} injection(s) / ${JSON.stringify(coldRead().provision)}`)
+  check('…against the gateway, exactly as the eager path does', coldSettings.writes[0]?.ops[0]?.value?.baseURL === 'https://api.cline.bot/api/v1', JSON.stringify(coldSettings.writes[0]?.ops[0]?.value?.baseURL))
+  coldDisposer()
+  check('the cold-boot hook is disposed again', globalThis.fetch === realFetch)
 
   globalThis.fetch = realFetch
   await new Promise((resolve) => control.close(resolve))

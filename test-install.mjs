@@ -204,7 +204,14 @@ console.log('\n── 5. canonical rows / upgrades ─────────�
   const h = home({ patch: legacy })
   h.install()
   const after = h.read(h.patchPath)
-  check('a legacy row is upgraded to the canonical config', !/baseURL:/.test(after) && !/listen:/.test(after) && /pin:\n          - deepseek/.test(after), JSON.stringify(after))
+  // Scoped to the loader row: the provider card this install also writes carries
+  // a `baseURL` of its own (that is the gateway the route points at).
+  const loaderRow = after.slice(0, after.indexOf('- id: llm-pi-ai'))
+  check(
+    'a legacy row is upgraded to the canonical config',
+    !/baseURL:/.test(loaderRow) && !/listen:/.test(loaderRow) && /pin:\n          - deepseek/.test(loaderRow),
+    JSON.stringify(loaderRow),
+  )
   check('upgrading keeps exactly one row', (after.match(/id: clinepass/g) ?? []).length === 1)
 }
 
@@ -272,6 +279,46 @@ console.log('\n── 7. comment above the removed provider ──────�
     threw = error
   }
   check('a regex-metacharacter provider name does not crash', threw === null, threw === null ? 'ok' : String(threw))
+}
+
+// ── 8. the provider card is declared, and only when it is ours to declare ───
+console.log('\n── 8. provider card ──────────────────────────────────────')
+{
+  const plain = home({ patch: '# layer\n[]\n' })
+  plain.install()
+  const declared = plain.read(plain.patchPath)
+  check('a profile with no `llm-pi-ai` row gains the Cline Pass card', /^- id: llm-pi-ai$/m.test(declared) && declared.includes('cline-pass:'), JSON.stringify(declared))
+  check(
+    '…declared for the pi-ai route, with the key env and the gateway',
+    declared.includes('apiKeyEnv: CLINE_PASS_API_KEY') && declared.includes('baseURL: https://api.cline.bot/api/v1'),
+    JSON.stringify(declared),
+  )
+  check('…and the loader row is still written', /- id: clinepass/.test(declared))
+  plain.install()
+  check('re-installing does not declare a second card', (plain.read(plain.patchPath).match(/^- id: llm-pi-ai$/gm) ?? []).length === 1, JSON.stringify(plain.read(plain.patchPath)))
+  plain.uninstall()
+  check('uninstall removes the card it declared', !/llm-pi-ai/.test(plain.read(plain.patchPath)), JSON.stringify(plain.read(plain.patchPath)))
+
+  // A row replaces the whole `config` of the entry it targets, so touching a row
+  // the user wrote would take their other providers with it.
+  const own = home({ patch: '# my own layer\n- id: llm-pi-ai\n  config:\n    providers:\n      deepseek:\n        apiKeyEnv: DEEPSEEK_API_KEY\n' })
+  const log = own.install()
+  const kept = own.read(own.patchPath)
+  check('a profile that declares `llm-pi-ai` keeps exactly its own row', (kept.match(/^- id: llm-pi-ai$/gm) ?? []).length === 1, JSON.stringify(kept))
+  check('…with its other providers intact and no card bolted on', kept.includes('DEEPSEEK_API_KEY') && !kept.includes('cline-pass:'), JSON.stringify(kept))
+  check('…and the installer says why it left it alone', /already declares `llm-pi-ai`/.test(log), JSON.stringify(log))
+  own.uninstall()
+  const after = own.read(own.patchPath)
+  check('uninstall leaves a user-declared provider row alone', after.includes('DEEPSEEK_API_KEY'), JSON.stringify(after))
+  check('…while still removing its own loader row', !/clinepass/.test(after), JSON.stringify(after))
+
+  const dry = home({ patch: '[]\n' })
+  const dryLog = dry.install('--dry-run')
+  check('--dry-run promises the card without writing it', /would append the `llm-pi-ai` provider row/.test(dryLog) && !/llm-pi-ai/.test(dry.read(dry.patchPath)), JSON.stringify(dryLog))
+
+  const noPatch = home({ patch: '[]\n' })
+  const noPatchLog = noPatch.install('--no-patch')
+  check('--no-patch writes no card either', /provider row skipped/.test(noPatchLog) && noPatch.read(noPatch.patchPath) === '[]\n', JSON.stringify(noPatchLog))
 }
 
 console.log(`\nRESULT: ${failures.length === 0 ? 'INSTALL OK' : `FAILED (${failures.join(' | ')})`}`)

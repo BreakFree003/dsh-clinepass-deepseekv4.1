@@ -147,19 +147,23 @@ surface op，不进上下文），绝不会装配 `assistant/message`，于是�
 
 `off` 不扣终止帧也不校验：回到「请求字段钉选 + 没有任何校验」的旧行为（它本来就是流式的）。
 
-插件启动时还会**自动登记**那条 provider profile：不存在就创建；如果它认得出是自己建的那张卡、只是地址过期了（例如从旧版反代换过来后地址还指着 `127.0.0.1:8791`），就只把地址改回来；认不出（是别人/手工建的）就原样不动并报警 —— 状态文件里是 `provision: "mismatch"` 加上一句 `provisionReason`。
+那张 provider 卡片本身是**声明式**的：包自带的 `cordis.patch.yml`（方式 A）或安装器（方式 B/C）把
+`llm-pi-ai.providers['cline-pass']` 写进 profile patch，**重启即有卡片，零运行时写入**（原因见
+「卡片怎么来的：随包声明」）。插件启动时仍会**试着登记**一次：认得出是自己那张卡、只是地址过期了
+（例如从旧版反代换过来后地址还指着 `127.0.0.1:8791`），就只把地址改回来；认不出（是别人/手工建的）
+就原样不动并报警 —— 状态文件里是 `provision: "mismatch"` 加上一句 `provisionReason`。
 
 ---
 
 ## 环境要求
 
 - dsh：实测过 `0.1.6-alpha.1`（本插件主要是在它上面开发与验证的）和 `0.1.7-rc.2`（下面
-  「实战记录」那一节所在的机器跑的就是它）。**0.1.7 与这个插件的自动登记不兼容，两条独立的原因**：
-  (1) settings 服务的 `get()` 被移除，值要经 `describe()` 读 —— 0.7.4 及更早会抛
-  `settings.get is not a function`（状态文件里 `provision: "failed"` + 原因），0.7.5 起已适配；
-  (2) **冷启动时 settings 服务还没注册**，插件读 `ctx.settings` 会抛 `cannot get property "settings"
-  without inject`，登记**根本不会开始**（`provision: null`）—— 这一条**没有修**，要自己把 provider
-  行写进 patch，见上面「在 dsh 0.1.7 上：这一行要自己写」。注意 npm 上**没有** `0.1.5` 这个版本，只有
+  「实战记录」那一节所在的机器跑的就是它）。这个版本上有两条与 settings 服务有关的坑，都已经处理：
+  (1) `get()` 被移除，值要经 `describe()` 读 —— 0.7.4 及更早会抛 `settings.get is not a function`
+  （状态文件里 `provision: "failed"` + 原因），0.7.5 起已适配；
+  (2) **冷启动时 settings 服务还没注册** —— 0.8.0 起改成走 `ctx.inject(['settings'], …)` 等它（不再抛），
+  并且**不再依赖这次写入**：卡片由包声明，见下面「卡片怎么来的：随包声明」。
+  注意 npm 上**没有** `0.1.5` 这个版本，只有
   `0.1.5-alpha.*` / `0.1.5-rc.*`；`dsh plugin` 与 `dsh.bundle` 相关的模块从 `0.1.2-alpha.3`
   的包里就已存在，但那些更早的版本没有实测过，不保证。
 - Node.js ≥ 20
@@ -241,38 +245,42 @@ node install.mjs --dry-run                     # 只看会改什么
 ### 然后
 
 1. **重启 dsh**（profile 只在启动时读取）：终端里 `Ctrl-C`，再 `dsh web`。
-2. **在 dsh 0.1.7 上，再自己写一次 provider 行**（见下一节 —— 这个版本上插件不会自动登记）。
-3. 打开 **设置 → 模型**：应当能看到一张 **Cline Pass** 卡片。把 API key 粘进去、保存。
-4. 在模型选择器里选 **Cline Pass / DeepSeek V4.1 Flash**。
+2. 打开 **设置 → 模型**：应当能看到一张 **Cline Pass** 卡片 —— 三种安装方式都会替你把
+   `llm-pi-ai.providers['cline-pass']` 声明好，**不需要手写任何东西**。把 API key 粘进去、保存。
+3. 在模型选择器里选 **Cline Pass / DeepSeek V4.1 Flash**。
 
-### 在 dsh 0.1.7 上：这一行要自己写
+> 唯一的例外是**你自己已经声明过 `- id: llm-pi-ai`** 的 profile：patch 按行整体替换 config、
+> 不是合并，谁也没法替你把 `cline-pass:` 塞进那一行。见下面「如果你自己声明了 `llm-pi-ai`」。
 
-**这不是「出问题时的兜底」，是安装步骤的一部分。** 插件本来会在启动时把
-`llm-pi-ai.providers['cline-pass']` 登记进去；在 dsh 0.1.7 上，**冷启动根本走不到那一步** ——
-干净 `DSH_HOME` 里的探针插件实测：
+### 卡片怎么来的：随包声明，不是启动时写进去的
 
-```
-{"step":"ctx.settings-threw","message":"cannot get property \"settings\" without inject"}
-{"step":"ctx.get-loose","found":false}
-```
+插件启动时**会**登记这张卡片（`provisionProfile`）：认得出就只修地址、绝不覆盖别人的卡片。
+但**它不能是唯一来源** —— dsh 0.1.7 上实测两件事：
 
-插件读的是 `ctx.settings`，而那一刻 settings 服务**还没注册**；cordis 的规矩是插件得先用
-`inject` 声明依赖才会被等待，本插件没有声明 —— 于是 `apply()` 在那一行当场中断，后面的登记
-一步都没跑。（热重载时不会这样：服务早就起来了。所以它只在**新装 / 冷启动**时露出来。
-0.1.6 时代实测过自动登记是好的；差异来自 dsh 的服务时序，没有逐版本定位。）
+1. **冷启动那一刻 settings 服务还没注册**。0.8.0 起插件不再直接读 `ctx.settings`（那会抛
+   `cannot get property "settings" without inject`，然后 `apply()` 当场中断、后面一步都不跑），
+   而是走 `ctx.inject(['settings'], …)` 等它 —— 探针实测 0.1.7 上服务确实会到
+   （`inject-fired` + `ctx.get('settings', false)` 可见）。
+2. **全新 profile 上的 settings 写入会一直等写锁**，不是报错而是一直挂着：干净 `DSH_HOME` 里实测，
+   拿着 `package.json.lock` 的正是 dsh 自己（进程空闲），状态文件停在 `provision: "pending"`，
+   patch 文件永远不落地。
 
-**怎么认出来**：`hook: installed` 正常，但状态文件里 `provision` 是 **`null`**（不是
-`failed`）—— `null` 就是「登记这一步根本没跑」的签名，设置页里也没有 Cline Pass 卡片。
+所以卡片改成**声明式**：由包自带的 `cordis.patch.yml`（方式 A）或安装器（方式 B/C）把
+`llm-pi-ai.providers['cline-pass']` 写进 profile patch。**重启即有卡片、零运行时写入** ——
+全新 profile 实测：`provision: "present"`（插件认出了它，什么都不用写）、profile 自己的
+`cordis.patch.yml` 保持 `[]` 不变、`package.json.lock` 也不再出现。
 
-**处理**：把下面这段贴进 `<DSH_HOME>/profiles/<profile>/cordis.patch.yml`，再重启 dsh。
-（那个文件是个 YAML 数组；里面只有 `[]` 时，整个换成下面这段。）值取自插件的默认配置 ——
-地址、协议、key 的存放名、模型 id、两个档位都对得上，所以插件随后能认出这张卡。
+`provision` 的取值因此变成：`present` = 卡片已在（新装的正常状态）；`created` / `repaired` /
+`mismatch` = 插件在运行时创建、修地址或发现卡片被改过（settings 服务到位时才会发生）；
+`pending` = 正在等服务注册、还没轮到它；`failed` / `unavailable` 看 `provisionReason`。
+
+### 如果你自己声明了 `llm-pi-ai`
+
+**只有这种情况需要你动手。** patch 是按行**整体替换** `config`、不是深度合并：你自己的
+`- id: llm-pi-ai` 会覆盖包里的那一行（连带 `cline-pass:`），所以请把这一段并进你自己的行：
 
 ```yaml
-- id: llm-pi-ai
-  config:
-    providers:
-      cline-pass:
+      cline-pass:            # 缩进到你自己的 providers: 底下
         displayName: Cline Pass
         api: openai-completions
         apiKeyEnv: CLINE_PASS_API_KEY
@@ -288,19 +296,18 @@ node install.mjs --dry-run                     # 只看会改什么
               max: max
 ```
 
+（整行的完整形态见本包根目录的 `cordis.patch.yml`。）安装器发现你已经声明过 `llm-pi-ai` 时会
+**跳过**这一步并在输出里说明 —— 它不会去替换你的行。
+
 **API key 照旧在设置页里粘**：上面的 `apiKeyEnv` 只是 key 的存放名，不是 key 本身。
 
-> **想让它自动登记？那要改插件本身** —— 把读 `ctx.settings` 换成
-> `ctx.inject(['settings'], (scoped) => { … })`，让登记发生在服务就位之后（钩子仍然立刻装上，
-> 不必等）。探针验证过这条路能拿到 settings 句柄。本仓库**选择不改**：一个独立插件的安装多做
-> 一步，比为了这个时序问题长出一套绕法更好维护。真去改的话，顺手把「等待中」和「失败」分成
-> 两个值 —— 现在 `provision: null` 与「没跑」长得一样，而这两件事的处理方式完全不同。
-
-> **同一版本上另一个坑（dsh 侧，没定性）**：干净 profile 里实测 settings 写入会卡在
-> `atomic-write: timed out waiting for the writer lock at <profile>/package.json.lock` ——
-> 锁文件里写着 dsh 自己的 pid，进程空闲，之后的重试不是报错而是一直挂着。它和本插件无关，
-> 但在这种 profile 上**设置页保存也会失败**。撞上了就停掉 dsh、删掉那个 `.lock`、再起；
-> 不要在 dsh 还活着的时候删，那个锁属于它。本插件的开发机（老 profile）上没有这个文件。
+> **为什么不干脆自带一套 provider 适配器（像别的独立插件那样）？** 两条硬约束：
+> 「设置 → 模型」的卡片按 **settings 命名空间**选布局（`layoutOf`），只有 `llm-pi-ai` /
+> `llm-deepseek` 有原生布局，别的命名空间渲染成一张**提交按钮被禁用、也没有 API key 输入框**的
+> 「unknown」卡片 —— 自带适配器就得自带浏览器半边 UI；而 `providerOptions.gateway.only` 这个字段
+> 在任何受支持的配置里都表达不出来（pi-ai 的 compat 开关被 dsh 的 pi-ai 适配器 `withhold` 掉），
+> 只能像本插件这样在 `fetch` 层改写请求体。复用内置 pi-ai 路由 + 声明式卡片是摩擦最小的路线，
+> **代价就是这张卡片挂在 `llm-pi-ai` 那一行上**。
 
 想让它成为默认模型，**dsh 0.1.7 上**是在同一个 profile patch 里加一行（0.1.6 及更早才是
 `~/.dsh/settings.yaml` 里那个 `agent-default-model:` 段）：
@@ -411,7 +418,7 @@ ClinePass 剩余用量                 更新于 15:25  刷新
 | `contextWindow` / `maxTokens` | `921600` / `131072` | 模型容量，登记 profile 时使用 |
 | `apiKeyEnv` | `CLINE_PASS_API_KEY` | profile 里记录的凭据引用 |
 | `enforcement` | `strict` | 边流边校验响应是否真由允许的渠道提供：`strict` = 违规就在终止帧之前中断这条流、这次调用作废（内容已显示，但不进上下文、不执行工具）；`warn` = 同样校验但只告警放行；`off` = 不校验、不扣终止帧 |
-| `provision` | `true` | 启动时自动登记 provider profile（缺失则创建；自家卡片地址过期则只修地址） |
+| `provision` | `true` | 启动时试着登记 provider 卡片：自家卡片地址过期就只修地址，别人的卡片不动。卡片本身已由包/安装器声明，所以新装时这里通常是 `present`（无事可做）；dsh 0.1.7 上服务未就位时会等它（`pending`），不会中断启动 |
 | `alignReasoningEffort` | `true` | 若 `agent-default-model.reasoningEffort` 不是本模型声明的档位（只剩 `high` / `max` 两个），启动时对齐：废弃的 `xhigh` → `max`，其它不认识的值 → `high` |
 | `plainModelId` | `true` | 提示词（persona 两段）里显示**去掉本路由前缀**的 id：`cline-pass/deepseek-v4.1-flash` → `deepseek-v4.1-flash`。线上 id、会话记录、选择器都不受影响；`false` 则原样显示完整 id |
 | `usage` | `true` | 在「设置 → 模型 → Cline Pass」卡片上显示用量条（5 小时 / 每周 / 每月，**剩余**量）。`false` 时宿主不注册路由、不读凭据，并显式广播 `enabled: false` 让浏览器半边**不渲染这张卡片**（浏览器半边是从 `package.json` 发现的，配置管不到它加载与否，所以必须显式告知） |
@@ -439,7 +446,7 @@ cat ~/.dsh/dsh-clinepass-status.json     # 正在跑的 dsh 自己写的状态�
 # 实际是 2 空格缩进的 JSON，字段就是这些：
 # {
 #   "service": "dsh-clinepass", "transport": "fetch", "hook": "installed",
-#   "provision": "present",   # created | present | repaired | mismatch | failed | off | unavailable
+#   "provision": "present",   # present | created | repaired | mismatch | pending | failed | off | unavailable
 #   "provisionReason": null,  # 上面那个值的原因（present / created 时为 null）
 #   "upstream": "https://api.cline.bot", "pin": ["deepseek"],
 #   "profileBaseURL": "https://api.cline.bot/api/v1",
@@ -547,7 +554,7 @@ reasoning、**两个 `bash` 工具调用**的完整参数，最后是 `usage` �
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| 设置 → 模型里没有 Cline Pass 卡片 | **dsh 0.1.7 上先按「在 dsh 0.1.7 上：这一行要自己写」把 `llm-pi-ai` 行写进 profile patch**（这个版本上插件不会自动登记，状态文件里 `provision` 是 `null`）；写完之后还没有那张卡片，再看 `provision` 的具体值与 `hook`（要 `installed`） |
+| 设置 → 模型里没有 Cline Pass 卡片 | 先确认**重启过 dsh**（卡片是随包声明在 profile patch 里的，只在启动时读）。还没有就看状态文件：`hook` 要是 `installed`；`provision: pending` = settings 服务还没到位；`mismatch` = 卡片被人改过地址。**如果你自己声明过 `- id: llm-pi-ai`**，卡片在你自己那一行里，按「如果你自己声明了 `llm-pi-ai`」把 `cline-pass:` 段带上 |
 | 卡片里 API 地址不是 `https://api.cline.bot/api/v1` | 那张卡片不是本插件建的（`provision: mismatch`），插件不去改它。改成网关地址，否则请求绕过钉选 |
 | 状态文件里 `hook: unavailable` | 有别的插件先替换了 `globalThis.fetch`。找出是哪个插件；现在没有备用 transport，钩子装不进去时请求会不带钉选 |
 | 状态文件里 `hook: foreign` | 装好之后全局 fetch 被别的代码换掉了（插件每 30 秒自查）。换掉之后的请求不再被钉，排查是哪个插件 |
@@ -582,22 +589,24 @@ npm 上另有一个名字很像的包 **`dsh-cline-pass`**（作者 yhshzh），
 **方式 A（bundle）装的：**
 
 ```sh
-# 1. 先摘掉自动登记的那张 provider 卡片 —— 这一步要在移除包之前跑
-DSH_HOME=~/.dsh node ~/.dsh/profiles/web/node_modules/dsh-clinepass/uninstall.mjs --profile web
-# 2. 再让 pnpm 移除包，并自动把它从 dsh.profile.bundles 摘掉
 dsh plugin --profile web remove dsh-clinepass
 ```
 
-第 1 步会顺带报「没找到 `clinepass` 行」「插件目录已不存在」——bundle 布局下这两件事本来
-就无事可做，它真正干活的是删掉 `settings.yaml` 里的 `llm-pi-ai.providers.cline-pass`。
-**dsh 0.1.7 上的那张卡片通常是你手写进 profile 的 `cordis.patch.yml` 的**：上面两步跑完回头看一眼，
-还在就自己删掉 `- id: llm-pi-ai` 那一行（或只删它 `providers` 里的 `cline-pass:` 段）。
-想留着那张卡片就加 `--keep-provider`。
+插件行和卡片都来自包自己的 `cordis.patch.yml`：包一摘掉（同时自动从 `dsh.profile.bundles` 摘掉）
+两样都没了，**你自己的 profile patch 全程没被碰过**。只有一种收尾情况：老版本用手工/安装器装的
+profile，patch 里留着指向本插件的行，那就先跑一次安装器自带的卸载器再删包 ——
+
+```sh
+DSH_HOME=~/.dsh node ~/.dsh/profiles/web/plugins/dsh-clinepass/uninstall.mjs --profile web
+```
+
+它会删掉 `clinepass` 行、插件目录，以及**它自己逐字写下的那种** provider 卡片；你在
+`llm-pi-ai` 行里自己写的 provider 不会被动（想留着卡片就加 `--keep-provider`）。
 
 **方式 B（安装器）装的：**
 
 ```sh
-node uninstall.mjs                  # 移除 loader 行 + 插件目录 + 自动登记的 profile
+node uninstall.mjs                  # 移除 loader 行 + 插件目录 + 它自己写的 provider 卡片
 node uninstall.mjs --keep-provider  # 保留设置页那张卡片
 ```
 

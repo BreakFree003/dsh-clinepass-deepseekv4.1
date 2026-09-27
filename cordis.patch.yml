@@ -37,3 +37,35 @@
         upstream: https://api.cline.bot
         pin:
           - deepseek
+
+# ── provider 卡片：静态声明，装上就有 ────────────────────────────────────────
+#
+# 插件自己也有一份运行时登记（index.js 的 provisionProfile）：它认得出这张卡、只修地址、
+# 绝不覆盖别人的卡。但**在 dsh 0.1.7 上不能依赖它**：冷启动那一刻 settings 服务还没注册
+# （插件读 `ctx.settings` 会抛 `cannot get property "settings" without inject`），而且这个
+# 版本上全新 profile 的 settings 写入会一直等 profile 清单的写锁（实测：`provision` 停在
+# `pending`，patch 文件永远不落地）。所以这里把 pi-ai profile 直接声明出来 ——
+# 不写任何东西、不看服务时序，重启即有卡片。
+#
+# `providers` 是 llm-pi-ai 的 `.volatile()` 字段，所以这些值在 设置 → 模型 里照样可编辑。
+#
+# **注意**：patch 是按行整体替换 config、不是合并。如果你在自己的
+# `$DSH_HOME/profiles/<profile>/cordis.patch.yml` 里也写了 `- id: llm-pi-ai`，你那一行会覆盖
+# 本行 —— 请把 `cline-pass:` 段一起写进去（README 里有整段可粘贴的内容）。
+- id: llm-pi-ai
+  config:
+    providers:
+      cline-pass:
+        displayName: Cline Pass
+        api: openai-completions
+        apiKeyEnv: CLINE_PASS_API_KEY
+        baseURL: https://api.cline.bot/api/v1
+        models:
+          - id: cline-pass/deepseek-v4.1-flash
+            name: DeepSeek V4.1 Flash
+            contextWindow: 921600
+            maxTokens: 131072
+            input: [text, image]
+            reasoningEfforts:
+              high: high
+              max: max

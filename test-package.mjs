@@ -9,7 +9,9 @@
  * different installs.
  *
  * Deliberately parser-free and dsh-free: this package ships no dependencies and
- * this file must run anywhere, and both documents are a single `- insert:` row.
+ * this file must run anywhere: the bundle patch carries one `- insert:` row
+ * and one `- id: llm-pi-ai` provider row, which this file compares against the
+ * blocks the installer and uninstaller write.
  *
  * Each invariant guarded here was a real bug or a real trap:
  *   - the `install` lifecycle script made pnpm refuse a git-hosted install
@@ -66,23 +68,64 @@ const meaningful = (text) =>
     .split('\n')
     .map((line) => line.replace(/\s+$/, ''))
     .filter((line) => line.trim() !== '' && !line.trim().startsWith('#'))
-const bundleLines = meaningful(read('cordis.patch.yml'))
+/** Top-level patch entries: a `- ` line starts one, everything after it belongs to it. */
+const entriesOf = (text) => {
+  const entries = []
+  for (const line of meaningful(text)) {
+    if (/^- /.test(line)) entries.push([line])
+    else if (entries.length > 0) entries[entries.length - 1].push(line)
+  }
+  return entries
+}
+const bundleEntries = entriesOf(read('cordis.patch.yml'))
+const insertBlock = bundleEntries.find((entry) => entry[0] === '- insert:')
+const providerEntry = bundleEntries.find((entry) => entry[0] === '- id: llm-pi-ai')
+check(
+  'the bundle patch carries the mount and the provider card, and nothing else',
+  bundleEntries.length === 2 && insertBlock !== undefined && providerEntry !== undefined,
+  JSON.stringify(bundleEntries.map((entry) => entry[0])),
+)
+
 const block = /const FETCH_BLOCK = `([\s\S]*?)`\n/.exec(read('install.mjs'))
 check('install.mjs still has a FETCH_BLOCK to compare against', block !== null)
-if (block !== null) {
+if (block !== null && insertBlock !== undefined) {
   const installerLines = meaningful(block[1])
   // The one permitted difference is the module specifier: the bundle resolves its
   // own bare package name, the installer points at the file it copied.
   const specifierNeutral = (lines) => lines.map((line) => (line.trim().startsWith('name:') ? '  name: <row>' : line))
   check(
     'both rows carry the same config',
-    JSON.stringify(specifierNeutral(bundleLines)) === JSON.stringify(specifierNeutral(installerLines)),
-    JSON.stringify(bundleLines),
+    JSON.stringify(specifierNeutral(insertBlock)) === JSON.stringify(specifierNeutral(installerLines)),
+    JSON.stringify(insertBlock),
   )
-  check('the bundle row mounts the same id as the installer', bundleLines.includes('    - id: clinepass') && installerLines.includes('    - id: clinepass'))
-  check('the bundle row names the bare package', bundleLines.includes('      name: dsh-clinepass'), JSON.stringify(bundleLines))
+  check('the bundle row mounts the same id as the installer', insertBlock.includes('    - id: clinepass') && installerLines.includes('    - id: clinepass'))
+  check('the bundle row names the bare package', insertBlock.includes('      name: dsh-clinepass'), JSON.stringify(insertBlock))
 }
-check('the row is an insert, not a disable/override', bundleLines[0] === '- insert:', bundleLines[0])
+check('the row is an insert, not a disable/override', insertBlock?.[0] === '- insert:')
+
+// The provider card ships as data, and the installer writes the same block.
+// Both are load-bearing: without the first the card only shows up when a run-time
+// settings write lands (not dependable on 0.1.7 — see the README), and without
+// the second the installer route mounts a hook with no card.
+const providerBlock = /const PROVIDER_BLOCK = `([\s\S]*?)`\n/.exec(read('install.mjs'))
+check('install.mjs has a PROVIDER_BLOCK to compare against', providerBlock !== null)
+if (providerBlock !== null && providerEntry !== undefined) {
+  check('the installer declares the same provider card', JSON.stringify(meaningful(providerBlock[1])) === JSON.stringify(providerEntry), JSON.stringify(providerEntry))
+}
+const uninstallBlock = /const PROVIDER_BLOCK = `([\s\S]*?)`\n/.exec(read('uninstall.mjs'))
+check(
+  'uninstall.mjs knows the same block, so it deletes only its own',
+  uninstallBlock !== null && providerBlock !== null && meaningful(uninstallBlock[1]).join('\n') === meaningful(providerBlock[1]).join('\n'),
+)
+const providerText = (providerEntry ?? []).join('\n')
+check(
+  'the provider card names the pi-ai route, the key env, the gateway and the model',
+  ['- id: llm-pi-ai', 'cline-pass:', 'api: openai-completions', 'apiKeyEnv: CLINE_PASS_API_KEY', 'baseURL: https://api.cline.bot/api/v1', 'id: cline-pass/deepseek-v4.1-flash'].every(
+    (needle) => providerText.includes(needle),
+  ),
+  JSON.stringify(providerEntry),
+)
+check('…and carries exactly one patch row, so it cannot replace a second one', (providerEntry ?? []).filter((line) => /^- /.test(line)).length === 1, JSON.stringify(providerEntry))
 
 // ── 5. the browser half is declared the way the client module system reads it ─
 console.log('\n── 5. client half declaration ────────────────────────────')

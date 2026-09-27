@@ -72,6 +72,28 @@ export const KEY_REF = 'CLINE_PASS_API_KEY'
 export const PROFILE_PATH = '/api/v1'
 
 /**
+ * 反射式取 settings 服务。
+ *
+ * **不要直接读 `ctx.settings`**：cordis 会拒绝未在 `inject` 里声明过的属性读取
+ * （`cannot get property "settings" without inject`），而**冷启动那一刻 settings 还没注册** ——
+ * 直接读会让 `apply()` 当场中断，后面的登记一步都不跑（0.1.7 上的实测症状：状态文件里
+ * `provision` 是 `pending`，设置页里没有卡片）。这里走反射式 `ctx.get()`：
+ * 拿得到就当场用，拿不到交给 `ctx.inject()` 等它注册。
+ *
+ * @param ctx - 插件上下文（或测试替身）。
+ * @returns settings 服务，未就位时为 `undefined`。
+ */
+function settingsService(ctx) {
+  try {
+    const candidate = ctx.get?.('settings')
+    if (candidate !== undefined && candidate !== null && typeof candidate.mutate === 'function') return candidate
+  } catch {
+    /* 未声明 inject / 尚未注册：cordis 会抛，这里正是要兜住的情况 */
+  }
+  return undefined
+}
+
+/**
  * 读一个命名空间当前的 live 值。
  *
  * dsh 0.1.7 起，settings 服务（`SettingsForms`）暴露的是 `describe()` / `update()` /
@@ -2085,22 +2107,41 @@ export async function apply(ctx, config) {
     )
   }
 
-  let provision = 'off'
+  // 登记结果先落一个 `pending`：状态文件里「还没跑」和「跑失败了」从此长得不一样。
+  let provision = 'pending'
   let provisionReason = null
-  if (cfg.provision) {
-    const settings = ctx.settings ?? ctx.get?.('settings')
-    if (settings === undefined || typeof settings.mutate !== 'function') {
-      provision = 'unavailable'
-      provisionReason = 'the settings service is not available in this composition, so the provider profile was neither read nor written'
-      logger.warn?.('[clinepass] settings service unavailable; the "%s" provider profile was not provisioned', cfg.provider)
-    } else {
+  const publishProvision = () => hook.noteProvision(provision, provisionReason)
+  const provisionWith = async (settings) => {
+    try {
       provision = await provisionProfile(settings, cfg, logger, (reason) => {
         provisionReason = reason
       })
       if (cfg.alignReasoningEffort) await alignReasoningEffort(settings, cfg, logger)
+    } catch (error) {
+      provision = 'failed'
+      provisionReason = `provisioning threw: ${error instanceof Error ? error.message : String(error)}`
+    }
+    publishProvision()
+  }
+  if (!cfg.provision) {
+    provision = 'off'
+    publishProvision()
+  } else {
+    publishProvision()
+    const settings = settingsService(ctx)
+    if (settings !== undefined) await provisionWith(settings)
+    else if (typeof ctx.inject === 'function') {
+      logger.info?.('[clinepass] the settings service is not up yet; provisioning the "%s" profile when it registers', cfg.provider)
+      ctx.inject(['settings'], (scoped) => {
+        void provisionWith(scoped.settings)
+      })
+    } else {
+      provision = 'unavailable'
+      provisionReason = 'the settings service is not available in this composition, and this host has no ctx.inject to wait on it, so the provider profile was neither read nor written'
+      logger.warn?.('[clinepass] settings service unavailable; the "%s" provider profile was not provisioned', cfg.provider)
+      publishProvision()
     }
   }
-  hook.noteProvision(provision, provisionReason)
 
   // `pending` until the child fiber below reports, `off` when the option is
   // disabled; only `installed` is announced as a route the browser may call.

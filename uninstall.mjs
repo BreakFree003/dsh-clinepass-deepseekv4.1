@@ -69,18 +69,67 @@ console.log(`dsh-clinepass uninstaller
 // ── 1. drop the loader row ──────────────────────────────────────────────────
 const rowPattern = idPattern('clinepass')
 
+/**
+ * The provider row exactly as `install.mjs` writes it — keep the two in step
+ * (test-package.mjs compares them). Comments included: only an entry we wrote
+ * byte-for-byte is ours to delete. A profile that declares its own `llm-pi-ai`
+ * row keeps it, because that row is where its other providers live.
+ */
+const PROVIDER_BLOCK = `# ── Cline Pass provider card ────────────────────────────────────────────────
+# Declared here rather than written at run time: on dsh 0.1.7 a plugin's settings
+# write is not dependable (see the README). A patch row replaces the whole config
+# of the row it targets, so keep the other providers you declare in here.
+- id: llm-pi-ai
+  config:
+    providers:
+      cline-pass:
+        displayName: Cline Pass
+        api: openai-completions
+        apiKeyEnv: CLINE_PASS_API_KEY
+        baseURL: https://api.cline.bot/api/v1
+        models:
+          - id: cline-pass/deepseek-v4.1-flash
+            name: DeepSeek V4.1 Flash
+            contextWindow: 921600
+            maxTokens: 131072
+            input: [text, image]
+            reasoningEfforts:
+              high: high
+              max: max`
+
+/** Trailing whitespace and blank edges dropped, CRLF folded: compare by content. */
+const normalized = (text) =>
+  String(text)
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/\s+$/, ''))
+    .join('\n')
+    .replace(/^\n+/, '')
+    .replace(/\n+$/, '')
+
 if (!fs.existsSync(patchPath)) {
   console.log('  no cordis.patch.yml — nothing to unmount')
 } else {
   const current = fs.readFileSync(patchPath, 'utf8')
   const parsed = parsePatch(current)
   const eol = parsed.eol
-  const keep = parsed.entries.filter((entry) => !entry.lines.some((line) => rowPattern.test(line)))
-  if (keep.length === parsed.entries.length) {
+  const ours = normalized(PROVIDER_BLOCK)
+  let droppedProvider = false
+  const keep = parsed.entries.filter((entry) => {
+    if (entry.lines.some((line) => rowPattern.test(line))) return false
+    if (normalized(entry.text ?? entry.lines.join('\n')) === ours) {
+      droppedProvider = true
+      return false
+    }
+    return true
+  })
+  const dropped = parsed.entries.length - keep.length
+  if (dropped === 0) {
     console.log('  no `clinepass` row found — nothing to remove')
   } else {
     const backup = `${patchPath}.bak-${stamp}`
-    console.log(`  ${dryRun ? 'would remove' : 'remove'} the loader row and its comment header (backup: ${path.basename(backup)})`)
+    const what = droppedProvider ? 'the loader row, the provider card it declared,' : 'the loader row and its comment header'
+    console.log(`  ${dryRun ? 'would remove' : 'remove'} ${what} (backup: ${path.basename(backup)})`)
     if (!dryRun) {
       fs.copyFileSync(patchPath, backup)
       // With no entries left the document must still be a YAML array; the blank
