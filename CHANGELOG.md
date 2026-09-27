@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.7.3
+
+**Documentation only — `index.js` is byte-identical to 0.7.2.** Corrects places
+where the docs contradicted each other or the code, and adds the release
+checklist whose step 5 was missed when 0.7.2 went out.
+
+- **The pin-spelling count.** The README claimed "一共试过 15 种写法" while 0.7.1's
+  own changelog said "Nine spellings". Neither count survives an audit, and a
+  number that contradicts another file is worse than no number at all: both now
+  state that every spelling tried was ignored, and name them.
+- **`fallbacksAvailable: []` is not what a strict pin looks like** — that has not
+  been true since 2026-09-22, when the gateway stopped honouring `only` and began
+  listing the same 15 other channels for every request. The FAQ row read a
+  non-empty list as the pin having failed; it now says the list is expected, and
+  that the no-fallback promise is delivered by the local gate.
+- **The English smoke-test description** still promised an assertion of "no
+  fallbacks", which 0.7.1 removed on purpose.
+- **Pin-a-tag examples** named `#v0.6.2` and `#v0.7.0`; they name `#v0.7.3` now.
+  0.7.0's release notes tell readers not to reference `v0.6.2` — the README was
+  recommending exactly that.
+- **The tested dsh version** was still "`0.1.6-alpha.1`（唯一实测过的版本）" while
+  the field record added for 0.7.2 documents a live `0.1.7-rc.2` install. Both are
+  named now, with what each one is evidence of.
+- **`RELEASING.md` is new** — the checklist this release exists because of.
+  `git push origin v1.2.3` creates a *tag*, not a Release, and the Releases page
+  stays empty until `gh release create` runs with the tarball. It carries the
+  rules this repository has already paid for: never re-point a published tag, tag
+  only versions a `package.json` actually shipped, and count assertions from the
+  output instead of memory.
+
+This release exists for the same reason 0.6.1 did: an install pinned to a tag
+should get documentation that is correct rather than a tarball that contradicts
+itself. The published v0.7.2 tag and its tarball are left exactly as built.
+
 ## 0.7.2
 
 **`strict` streams again: the gate withholds only the SSE terminator, so a
