@@ -248,8 +248,10 @@ if (has('no-patch')) {
 console.log(`
 Next steps
   1. Restart dsh (the profile is read at startup):   Ctrl-C, then \`dsh web\`
-  2. Open Settings → Models. A "Cline Pass" card appears (the plugin provisions
-     it on start). Paste your Cline Pass API key there and save.
+  2. Open Settings → Models. A "Cline Pass" card is there — this installer wrote
+     the \`llm-pi-ai\` row that declares it (the plugin can also register it at run
+     time, but that write is not dependable on dsh 0.1.7). Paste your Cline Pass
+     API key there and save.
   3. Pick "Cline Pass / DeepSeek V4.1 Flash" in the model selector.
 
 Verify
