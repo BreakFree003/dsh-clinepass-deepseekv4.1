@@ -1021,6 +1021,60 @@ export function judgeRoutings(routings, allowed) {
 }
 
 /**
+ * 一个渠道名要进错误文案，必须**形状像网关的 slug**（小写字母数字 + `.` `_` `-`）。
+ */
+const CHANNEL_SLUG = /^[a-z0-9][a-z0-9._-]{0,31}$/
+
+/**
+ * 会踩到 dsh 那几套判定的词根：可重试分类（rate / timeout / network / 5xx）、配额，
+ * 以及**会触发会话压缩**的上下文溢出。
+ *
+ * 渠道名是**网关给的数据**，而 dsh 会在错误文案上跑多套正则判定。文案允许插值的前提是
+ * 「插的必须是形状合规且不含这些词根的名字」——否则退回一句不含动态内容的说法（原始名
+ * 仍进 `detail` 与状态文件的 `violations`）。这是护栏不是证明：判定随时会增补，所以规则
+ * 保持「宁可少显示，也不让被审的那一方有机会写判词」。
+ */
+const CHANNEL_RISKY = /(context|overflow|exceed|token|length|limit|rate|quota|balance|credit|insufficient|timeout|network|transport|server|error|fail|abort|cancel|retry|busy|overload|capacity|invalid|unauthor|forbidden|unavailable|internal|5\d\d)/i
+
+/**
+ * 这个渠道名能不能安全地写进错误文案。
+ *
+ * @param raw - routing 里读到的渠道名。
+ * @returns 可展示的名字，或 null（此时文案只说「名称未通过展示检查」）。
+ */
+export function displayableChannel(raw) {
+  if (typeof raw !== 'string') return null
+  const name = raw.trim().toLowerCase()
+  if (name.length === 0 || !CHANNEL_SLUG.test(name)) return null
+  if (CHANNEL_RISKY.test(name)) return null
+  return name
+}
+
+/**
+ * 从被拒的那处 routing 里读出**这次到底是谁服务的**：`finalProvider` → `resolvedProvider`
+ * → 第一个成功过的非允许渠道 attempt。三者都指向允许渠道（或根本没有元数据）时返回 null。
+ *
+ * @param routing - {@link judgeRoutings} 给出的 `culprit`。
+ * @param allowed - 允许的渠道列表。
+ * @returns 违规渠道的**原始**名字，或 null。
+ */
+export function offenderOf(routing, allowed) {
+  const allow = new Set(allowed)
+  const foreign = (value) => (typeof value === 'string' && value.length > 0 && !allow.has(value) ? value : null)
+  const direct = foreign(routing?.finalProvider) ?? foreign(routing?.resolvedProvider)
+  if (direct !== null) return direct
+  for (const model of Array.isArray(routing?.modelAttempts) ? routing.modelAttempts : []) {
+    for (const attempt of Array.isArray(model?.providerAttempts) ? model.providerAttempts : []) {
+      if (attempt?.success === true) {
+        const name = foreign(attempt.provider)
+        if (name !== null) return name
+      }
+    }
+  }
+  return null
+}
+
+/**
  * 用已缓冲的原文重建响应。
  *
  * `content-encoding` / `content-length` 必须删掉：body 已经被解码成文本，留着
@@ -1049,8 +1103,8 @@ function bufferedResponse(text, response) {
  * @param allowed - 允许的渠道列表。
  * @returns 400 响应。
  */
-function refusalResponse(reason, allowed) {
-  const message = refusalMessage(false)
+function refusalResponse(reason, allowed, culprit = null) {
+  const message = refusalMessage(false, offenderOf(culprit, allowed), allowed)
   return new Response(
     JSON.stringify({ error: { code: 'PROVIDER_PIN_VIOLATION', type: 'provider_pin_violation', message, allowed } }),
     {
@@ -1062,16 +1116,19 @@ function refusalResponse(reason, allowed) {
 }
 
 /**
- * 违规文案。**一个字都不来自网关**。
+ * 违规文案。**点名渠道，但只点得起名的渠道**。
  *
  * dsh 会在错误文案上跑**多个**判定：`mapStopReason` 先用 pi-ai 的上下文溢出模式与
  * `isContextWindowExceededError`，再是配额，最后才是 `classifyPiAiError`。它们决定要不要
- * 重试，溢出那条**还会触发会话压缩**。渠道名由网关给 —— 把被审方的字符串喂给裁判，就是给
- * 对手改判词的机会：一个叫 `context_length_exceeded` 的渠道名足以让 dsh 去压缩你的会话。
- * 所以 message 只放固定文案，诊断（含渠道名）走三处不参与判定的地方：插件日志、
- * 状态文件的 `lastViolation`、错误对象的 `detail` 属性。**不要试图给 message 加护栏正则**：
- * 判定有好几套、随时会增补，护栏必然滞后；这里的保证是「message 里没有任何动态内容」，
- * 由测试用「换任何渠道名文案都必须逐字相同」来钉住。
+ * 重试，溢出那条**还会触发会话压缩**。渠道名由网关给 —— 把被审方的字符串原样喂给裁判，
+ * 就是给对手改判词的机会：一个叫 `context_length_exceeded` 的渠道名足以让 dsh 去压缩你的
+ * 会话。所以插值只走 {@link displayableChannel} 的闸：形状像 slug、且不含任何判定词根的
+ * 名字才写进文案；闸外的一律退回固定说法，原始名仍旧进 `detail`、状态文件的 `violations`
+ * 与插件日志 —— 这三处都不参与判定。
+ *
+ * 这不是「加个正则就安全了」的证明，判定随时会增补；它保证的是**被审方无法自己选择写进
+ * 文案的字符串**（能写进去的只有网关那 16 个 slug 形状的名字）。测试钉两件事：安全名必须
+ * 出现，恶意名必须一个字都不出现、且彼此逐字相同。
  *
  * 流式与缓冲两种拒法的后果不同，文案必须说清：缓冲（非流式响应）时内容从未离开网关；
  * 流式时内容已经边流边显示过，只是在**装配之前**把这次调用作废了 —— 模型上下文里没有
@@ -1081,13 +1138,23 @@ function refusalResponse(reason, allowed) {
  * 分类，命中就会被默认重试策略当成可重试错误。
  *
  * @param streamed - 是否是「已经流出去过」的那条路径。
+ * @param offender - 违规渠道的原始名（{@link offenderOf}），读不出时 null。
+ * @param allowed - 允许的渠道列表（来自本地配置，不是网关数据）。
  * @returns 展示给用户的文案。
  */
-function refusalMessage(streamed) {
+function refusalMessage(streamed, offender, allowed) {
+  const allowList = allowed.length > 0 ? allowed.join('/') : '（空）'
+  const shown = displayableChannel(offender)
+  const who =
+    offender === null
+      ? '没能证明来源（响应里没有可用的 routing 元数据）'
+      : shown === null
+        ? '由允许列表之外的渠道提供（名称未通过展示检查，原始名见状态文件的 violations 与错误 detail）'
+        : `由 ${shown} 提供`
   const tail = streamed
     ? '这次调用已作废：内容没有进入模型上下文、工具也不会执行（可能已在窗口里闪现）。enforcement=strict；想只告警就设 enforcement: "warn"。'
     : '已丢弃这条响应、没有交给模型（enforcement=strict；想只告警就设 enforcement: "warn"）。'
-  return `cline-pass 渠道校验未通过：响应不是由允许的渠道提供（哪个渠道见状态文件的 lastViolation 与 dsh 日志）。${tail}`
+  return `cline-pass 渠道校验未通过：本次响应${who}，允许列表是 ${allowList}。${tail}`
 }
 
 /**
@@ -1099,12 +1166,13 @@ function refusalMessage(streamed) {
  * —— 于是工具不会执行。注意**终止帧必须扣住**：只要 `data: [DONE]` 先到了消费者手里，
  * 适配器就会当成正常收尾去装配消息，那时候再报错已经晚了。
  *
- * @param reason - 判定失败的说明（只放进 `detail` 与日志，**不进 message**）。
+ * @param reason - 判定失败的说明（只放进 `detail` 与日志）。
  * @param allowed - 允许的渠道列表。
+ * @param culprit - 被拒的那处 routing（用来在文案里点名渠道）。
  * @returns 抛进响应流的错误。
  */
-function refusalError(reason, allowed) {
-  const error = new Error(refusalMessage(true))
+function refusalError(reason, allowed, culprit = null) {
+  const error = new Error(refusalMessage(true, offenderOf(culprit, allowed), allowed))
   error.name = 'ClinePassPinViolation'
   error.code = 'PROVIDER_PIN_VIOLATION'
   error.allowed = [...allowed]
@@ -1197,6 +1265,12 @@ export function createFetchPin(config, logger = console) {
   /** 最近一次校验通过 / 被拦下的记录（status 文件里能直接看到「网关把它交给了谁」）。 */
   let lastVerified = null
   let lastViolation = null
+  /**
+   * 违规**历史**：只留最后一条的 `lastViolation` 答不了「今天被拦的那几次各自路由去哪」。
+   * 有界，免得一次网关抽风把状态文件撑大。
+   */
+  let violations = []
+  const VIOLATION_HISTORY_LIMIT = 20
   let lastUnverified = null
   /** 最近一次「这个请求没被钉上」以及原因（README 让用户按 seen/pinned 查的就是它）。 */
   let lastSkipped = null
@@ -1244,6 +1318,8 @@ export function createFetchPin(config, logger = console) {
           enforcement: cfg.enforcement,
           lastVerified,
           lastViolation,
+          // 最近 {@link VIOLATION_HISTORY_LIMIT} 条违规，按时间正序（最新在最后）。
+          violations: [...violations],
           lastUnverified,
           lastSkipped,
           // Config keys that were read and ignored, so an upgrade from the
@@ -1334,17 +1410,23 @@ export function createFetchPin(config, logger = console) {
    * @param reason - 判定失败的说明。
    * @param allowed - 允许的渠道列表。
    * @param routing - 读出（或读不出）的 routing。
+   * @param url - 这次被拦下的请求地址（进历史，便于对上「哪一轮」）。
    * @returns 给调用方的响应（strict 拒绝，warn 放行由调用方决定）。
    */
-  function recordViolation(reason, allowed, routing) {
+  function recordViolation(reason, allowed, routing, url = null) {
     counters.blocked += 1
-    lastViolation = {
+    const entry = {
       at: new Date().toISOString(),
+      url,
       allowed: [...allowed],
       reason,
       finalProvider: typeof routing?.finalProvider === 'string' ? routing.finalProvider : null,
       fallbacksAvailable: Array.isArray(routing?.fallbacksAvailable) ? routing.fallbacksAvailable.slice(0, 20) : null,
     }
+    lastViolation = { ...entry }
+    // 历史比单槽多答一个问题：**今天被拦的每一次**各自路由去哪。`at` 是唯一能把它和
+    // dsh 会话日志里那条 `turn/end` 错误对上的字段，所以必须写。
+    violations = [...violations, entry].slice(-VIOLATION_HISTORY_LIMIT)
     publish()
     logger.error?.('[clinepass] ✗ 拦下一条不是 %s 提供的响应：%s', allowed.join('/'), reason)
   }
@@ -1401,7 +1483,7 @@ export function createFetchPin(config, logger = console) {
       // 「已中止」路径（否则会显示成一条莫名其妙的 400，还污染 blocked 计数）。
       if (signal?.aborted === true || (error instanceof Error && error.name === 'AbortError')) throw error
       const reason = `响应体读取失败（${error instanceof Error ? error.message : String(error)}），无法确认它由允许的渠道提供`
-      recordViolation(reason, allowed, null)
+      recordViolation(reason, allowed, null, url)
       return refusalResponse(reason, allowed)
     }
     let routings = []
@@ -1415,9 +1497,9 @@ export function createFetchPin(config, logger = console) {
       recordVerified(url, verdict, allowed)
       return bufferedResponse(text, response)
     }
-    recordViolation(verdict.reason, allowed, verdict.culprit ?? null)
+    recordViolation(verdict.reason, allowed, verdict.culprit ?? null, url)
     if (cfg.enforcement === 'warn') return bufferedResponse(text, response)
-    return refusalResponse(verdict.reason, allowed)
+    return refusalResponse(verdict.reason, allowed, verdict.culprit ?? null)
   }
 
   /**
@@ -1505,14 +1587,14 @@ export function createFetchPin(config, logger = console) {
         controller.close()
         return
       }
-      recordViolation(verdict.reason, allowed, verdict.culprit ?? null)
+      recordViolation(verdict.reason, allowed, verdict.culprit ?? null, url)
       if (!holdTerminator) {
         // warn：终止帧早就放行了，这里只需要收尾。
         controller.close()
         return
       }
       // 扣住的终止帧就此丢掉：消费者看到的是流中断，而不是一次正常收尾。
-      controller.error(refusalError(verdict.reason, allowed))
+      controller.error(refusalError(verdict.reason, allowed, verdict.culprit ?? null))
     }
     /**
      * 处理一帧：先读它的每一处 routing，再决定转发还是扣住。
@@ -1738,6 +1820,7 @@ export function createFetchPin(config, logger = console) {
       lastPin,
       lastVerified,
       lastViolation,
+      violations: [...violations],
       lastUnverified,
       lastSkipped,
     }),

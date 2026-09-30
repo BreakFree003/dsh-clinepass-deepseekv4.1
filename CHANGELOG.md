@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.9.0
+
+Two changes to the diagnostics, both driven by one real question that the status
+file could not answer: *"the calls that got blocked today — which channel was
+each one actually routed to?"* Four of them landed inside two minutes
+(2026-09-30 19:33–19:36), the visible error named no channel, and only the last
+one survived in `lastViolation`. Every earlier one was unattributable.
+
+- **The refusal message names the filtered channel** — `cline-pass 渠道校验未通过：
+  本次响应由 baseten 提供，允许列表是 deepseek。…`. This reverses the old
+  "message must contain no dynamic content" rule, but not the reason behind it:
+  dsh runs several regex classifiers over error text (retry classification,
+  quota, and context overflow — **which triggers compaction**), so a gateway-supplied
+  string is attacker-chosen input to a judge. The interpolation therefore goes
+  through `displayableChannel()`: only names with a slug shape **and** no
+  classifier-triggering word root (`context` / `limit` / `rate` / `timeout` /
+  `5xx` / …) reach the message; everything else falls back to a fixed sentence.
+  All 16 real channel names pass, so the user sees the channel in practice. The
+  test now pins both sides: a normal name *must* appear, hostile names
+  (`context_length_exceeded`, `rate_limit`, `channel-500`, …) must not appear
+  and must yield byte-identical messages. The raw name still reaches the three
+  diagnostic channels that are never classified: `detail`, the status file, and
+  the plugin log.
+- **`violations`: a bounded (20) history of blocked calls** in the status file,
+  each entry `{at, url, allowed, reason, finalProvider, fallbacksAvailable}`.
+  `lastViolation` keeps its old single-slot shape. `at` is the field that lines a
+  violation up with the `turn/end` error in dsh's own session log, which is how
+  the later analysis of the four 19:33–19:36 blocks was done — retrofitting the
+  history is what makes that analysis possible next time without a live
+  reproduction.
+
+Also re-verified the gateway itself (2026-09-30, live): `providerOptions.gateway.only`
+is **still** not honoured — pinning `['baseten']` is still served by `deepseek`,
+with routing metadata byte-identical to pinning `['deepseek']` or nothing. The
+response metadata did grow new fields (`affinity: {outcome, pinnedProvider}`,
+nested `modelAttempts[].providerAttempts[]`, `totalProviderAttemptCount`,
+`originalModelId`, `clientSessionId`), and `affinity.pinnedProvider` is the
+gateway's own preference (always `deepseek`, the first system channel) rather
+than an echo of our request — pinning via an `affinity` request field was tried
+and is ignored too. The fields the local gate reads are all still present, so no
+verification change was needed. One debugging note worth keeping: a `max_tokens`
+that is too small (24) makes the gateway answer HTTP 500
+`{"error":"empty response content","success":false}` — that is a token-budget
+artifact, not a routing problem.
+
+`test-fetch.mjs` grew both contracts (7 checks that fail on the 0.8.0 code:
+no channel named, no history, no bound).
+
+One stale assertion was fixed while testing this against the live gateway:
+`smoke-test.mjs --negative` asserted that an impossible pin is *refused* with
+`No available providers match the 'only' filter`. That stopped being true on
+2026-09-22 (when the gateway began ignoring provider routing options), so the
+check had been quietly red for eight days — worse than no check, because a suite
+nobody can get green stops being read. It now asserts the documented reality:
+the gateway answers 200 and serves the request anyway (`finalProvider: deepseek`,
+16 fallbacks offered), which is exactly why enforcement lives in this plugin.
+Section 3 of the same run is the positive proof: a stream deliberately allowed
+only `alibaba` but served by `deepseek` is refused with the new message naming
+`deepseek`, and no completion reaches the caller.
+
 ## 0.8.0
 
 The Cline Pass card is now **declared by the package** instead of being written by

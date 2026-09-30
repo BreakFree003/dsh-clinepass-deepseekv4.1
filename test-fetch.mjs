@@ -1417,7 +1417,11 @@ console.log('\n── 14. the streamed gate, attacked ────────�
     const body = await response.text()
     check('the buffered path judges every routing too', response.status === 400 && /PROVIDER_PIN_VIOLATION/.test(body), `HTTP ${response.status}`)
     check('…and records the rejected one', hook.state().lastViolation?.finalProvider === 'alibaba', JSON.stringify(hook.state().lastViolation ?? null).slice(0, 110))
-    check('…while its 400 body carries no gateway-supplied slug', !/alibaba/.test(JSON.parse(body).error.message) && JSON.parse(body).error.allowed.join() === 'deepseek', body.slice(0, 120))
+    check(
+      '…and its 400 body names the offending channel',
+      /由 alibaba 提供/.test(JSON.parse(body).error.message) && JSON.parse(body).error.allowed.join() === 'deepseek',
+      JSON.parse(body).error.message.slice(0, 120),
+    )
     hook.uninstall()
     stub.restore()
   }
@@ -1459,12 +1463,15 @@ console.log('\n── 14. the streamed gate, attacked ────────�
     stub.restore()
   }
 
-  // dsh 会在错误文案上跑好几套判定（重试分类、上下文溢出 → **会话压缩**、配额），而渠道名
-  // 来自网关。所以拒绝文案必须**与网关输入无关**：换任何渠道名，文案都要逐字相同。
-  // 这里不去镜像那几套正则（镜像必然滞后，第一版就是这么漏的），直接钉住「不插值」。
+  // 违规文案要**点名**被拦下的渠道 —— 否则用户拿到的信息量为零（这正是它被改掉的原因）。
+  // 但渠道名来自网关，而 dsh 会在文案上跑好几套判定（重试分类、上下文溢出 → **会话压缩**、
+  // 配额）。所以契约是两面的：**安全形状的名字必须出现，危险形状的名字一个字都不许出现**，
+  // 并且后者彼此逐字相同 —— 换任何危险名都不能改变文案，等于夺走被审方选判词的能力。
   {
+    const safe = ['alibaba', 'baseten']
+    const hostile = ['channel-500', 'context_length_exceeded', 'insufficient-balance', 'rate_limit', 'not a slug', 'x'.repeat(64)]
     const messages = new Map()
-    for (const slug of ['alibaba', 'channel-500', 'context_length_exceeded', 'insufficient-balance', 'rate_limit']) {
+    for (const slug of [...safe, ...hostile]) {
       const stub = stubFetch(() => sse(wire([delta(0), routingFrame(slug)])))
       const hook = createFetchPin({}, recorder())
       hook.install()
@@ -1473,11 +1480,75 @@ console.log('\n── 14. the streamed gate, attacked ────────�
       hook.uninstall()
       stub.restore()
     }
-    const all = [...messages.values()].map((entry) => entry.message)
-    const first = all[0]
-    check('the refusal message does not depend on the channel name at all', all.every((message) => message === first), `${new Set(all).size} distinct messages`)
-    check('…so no channel name can steer any classifier reading it', all.every((message) => !/alibaba|channel-500|context_length_exceeded|insufficient-balance|rate_limit/.test(message)), first.slice(0, 80))
-    check('…while the culprit still reaches the diagnostic channels', [...messages.entries()].every(([slug, entry]) => entry.detail.includes(slug) && entry.recorded === slug), JSON.stringify([...messages.entries()].map(([slug, entry]) => [slug, entry.recorded])).slice(0, 140))
+    check(
+      'a normal channel name is named in the refusal message',
+      safe.every((slug) => messages.get(slug).message.includes(`由 ${slug} 提供`)),
+      safe.map((slug) => `${slug}: ${messages.get(slug).message.slice(0, 60)}`).join(' | '),
+    )
+    const hostileMessages = hostile.map((slug) => messages.get(slug).message)
+    check(
+      'a hostile channel name never reaches the message',
+      hostile.every((slug) => !messages.get(slug).message.includes(slug)),
+      hostileMessages[0].slice(0, 120),
+    )
+    check(
+      '…and every hostile name yields the same message (no steering)',
+      new Set(hostileMessages).size === 1,
+      `${new Set(hostileMessages).size} distinct messages`,
+    )
+    check(
+      '…while the culprit still reaches the diagnostic channels',
+      [...messages.entries()].every(([slug, entry]) => entry.detail.includes(slug) && entry.recorded === slug),
+      JSON.stringify([...messages.entries()].map(([slug, entry]) => [slug, entry.recorded])).slice(0, 140),
+    )
+  }
+
+  // 违规历史：单槽 `lastViolation` 只能回答「最近一次」。用户问的是「今天被拦的那几次各自
+  // 路由去哪」，所以每一条都得留下（`at` 是唯一能把它和 dsh 会话日志里那条 `turn/end`
+  // 错误对上的字段），并且**有界** —— 网关抽风时不能把状态文件撑爆。
+  {
+    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('alibaba')])))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    const after = hook.state()
+    const kept = after.violations ?? []
+    check(
+      'every violation is kept, in order, not just the last one',
+      kept.length === 2 &&
+        kept.every((entry) => entry.finalProvider === 'alibaba') &&
+        kept[0].at <= kept[1].at &&
+        kept[1].at === after.lastViolation.at,
+      JSON.stringify(kept).slice(0, 160),
+    )
+    check(
+      '…each entry says when and where it happened',
+      kept.length === 2 &&
+        kept.every(
+          (entry) => typeof entry.at === 'string' && entry.url === CHAT && Array.isArray(entry.allowed) && typeof entry.reason === 'string',
+        ),
+      JSON.stringify(kept[0] ?? null).slice(0, 160),
+    )
+    check(
+      '…and the same history reaches the status file on disk',
+      (JSON.parse(fs.readFileSync(STATUS, 'utf8')).violations ?? []).length === 2,
+      JSON.stringify(JSON.parse(fs.readFileSync(STATUS, 'utf8')).violations ?? null).slice(0, 120),
+    )
+    for (let index = 0; index < 20; index += 1) await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
+    const bounded = hook.state().violations ?? []
+    check(
+      'the history is bounded (the status file cannot grow without limit)',
+      bounded.length === 20 && hook.counters.blocked === 22,
+      `violations=${bounded.length}, blocked=${hook.counters.blocked}`,
+    )
+    check(
+      '…and the bound drops the oldest, keeping the newest',
+      bounded.length > 0 && bounded[bounded.length - 1].at === hook.state().lastViolation.at,
+      JSON.stringify(bounded[bounded.length - 1] ?? null).slice(0, 120),
+    )
+    hook.uninstall()
+    stub.restore()
   }
 }
 

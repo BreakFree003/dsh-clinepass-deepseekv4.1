@@ -380,7 +380,23 @@ if (argv.includes('--negative')) {
     body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], providerOptions: { gateway: { only: ['__no_such_upstream__'] } } }),
   })
   const text = await response.text()
-  check('an impossible pin is refused', /No available providers match the 'only' filter/.test(text), `${response.status} ${text.slice(0, 90)}`)
+  // 这一节以前断言网关回 `No available providers match the 'only' filter`。那是 2026-09-22
+  // **之前**的行为：网关此后整个忽略 provider 路由选项块（实测钉真渠道 / 钉假渠道 / 完全不钉，
+  // routing 元数据逐字相同 —— 见 README 那张表与 2026-09-30 复测）。所以这条负控制现在证明的
+  // 正好相反：**请求字段不再承担任何钉选**，唯一还在兑现的是本地闸（第 3 节）。
+  // 旧断言让 `--negative` 静默红了 8 天 —— 那比没有断言更糟，所以按事实改掉它。
+  const { routingsOfText } = await import('./index.js')
+  const routing = routingsOfText(text)[0] ?? null
+  check(
+    'the gateway no longer refuses an impossible pin — the request field is dead',
+    response.status === 200 && routing !== null && routing.finalProvider !== '__no_such_upstream__',
+    `${response.status} finalProvider=${routing?.finalProvider ?? 'no routing metadata'}`,
+  )
+  check(
+    '…so an impossible pin buys nothing: the local gate is the only enforcement',
+    routing !== null && Array.isArray(routing.fallbacksAvailable) && routing.fallbacksAvailable.length > 1,
+    `${routing?.fallbacksAvailable?.length ?? 0} fallbacks offered`,
+  )
 }
 
 hook?.uninstall()
